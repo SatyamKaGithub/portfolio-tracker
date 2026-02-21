@@ -17,3 +17,12 @@ class Price(Base):
     symbol = Column(String, index=True)
     price = Column(Float)
     date = Column(Date, default=date.today)
+
+class PortfolioSnapshot(Base):
+    __tablename__ = "portfolio_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    total_value = Column(Float)
+    total_invested = Column(Float)
+    pnl = Column(Float)
+    date = Column(Date, default=date.today)

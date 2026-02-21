@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from app.models import Holding, Price
+from app.models import Holding, Price, PortfolioSnapshot
 from datetime import date
 import yfinance as yf
 
@@ -26,6 +26,23 @@ def update_prices(db: Session):
             db.add(new_price)
 
     db.commit()
+
+    # After prices are updated, calculate and store portfolio snapshot
+    portfolio_data = calculate_portfolio_value(db)
+
+    existing_snapshot = db.query(PortfolioSnapshot).filter(
+        PortfolioSnapshot.date == today
+    ).first()
+
+    if not existing_snapshot:
+        snapshot = PortfolioSnapshot(
+            total_value=portfolio_data["total_current_value"],
+            total_invested=portfolio_data["total_invested"],
+            pnl=portfolio_data["total_pnl"],
+            date=today
+        )
+        db.add(snapshot)
+        db.commit()
 
 
 def calculate_portfolio_value(db: Session):
