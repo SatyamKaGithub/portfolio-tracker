@@ -4,6 +4,9 @@ from sqlalchemy.orm import Session
 from app.db import engine, SessionLocal
 from app.models import Holding
 from app.schemas import HoldingCreate
+from app.models import PortfolioSnapshot
+from app.services import calculate_performance_metrics
+from app.services import calculate_max_drawdown
 
 app = FastAPI()
 
@@ -44,3 +47,15 @@ def get_portfolio_value(db: Session = Depends(get_db)):
 def refresh_prices(db: Session = Depends(get_db)):
     update_prices(db)
     return {"message": "Prices updated"}
+
+@app.get("/portfolio/history")
+def get_portfolio_history(db: Session = Depends(get_db)):
+    return db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+@app.get("/portfolio/performance")
+def get_portfolio_performance(db: Session = Depends(get_db)):
+    return calculate_performance_metrics(db)
+    
+@app.get("/portfolio/drawdown")
+def get_portfolio_drawdown(db: Session = Depends(get_db)):
+    return calculate_max_drawdown(db)

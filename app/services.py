@@ -74,3 +74,44 @@ def calculate_portfolio_value(db: Session):
         "total_current_value": round(total_current_value, 2),
         "total_pnl": round(total_pnl, 2)
     }
+
+def calculate_performance_metrics(db: Session):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+    if len(snapshots) < 2:
+        return {"message": "Not enough data for performance calculation"}
+
+    start_value = snapshots[0].total_value
+    latest_value = snapshots[-1].total_value
+
+    absolute_return_percent = ((latest_value - start_value) / start_value) * 100
+
+    return {
+        "start_value": start_value,
+        "latest_value": latest_value,
+        "absolute_return_percent": round(absolute_return_percent, 2)
+    }
+
+def calculate_max_drawdown(db: Session):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+    if len(snapshots) < 2:
+        return {"message": "Not enough data for drawdown calculation"}
+
+    peak = snapshots[0].total_value
+    max_drawdown = 0
+
+    for snapshot in snapshots:
+        value = snapshot.total_value
+
+        if value > peak:
+            peak = value
+
+        drawdown = (value - peak) / peak
+
+        if drawdown < max_drawdown:
+            max_drawdown = drawdown
+
+    return {
+        "max_drawdown_percent": round(max_drawdown * 100, 2)
+    }
