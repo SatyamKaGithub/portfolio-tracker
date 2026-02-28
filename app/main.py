@@ -7,6 +7,10 @@ from app.schemas import HoldingCreate
 from app.models import PortfolioSnapshot
 from app.services import calculate_performance_metrics
 from app.services import calculate_max_drawdown
+from app.services import calculate_volatility
+from app.services import calculate_sharpe_ratio
+from app.services import calculate_rolling_volatility
+from app.services import calculate_beta
 
 app = FastAPI()
 
@@ -59,3 +63,23 @@ def get_portfolio_performance(db: Session = Depends(get_db)):
 @app.get("/portfolio/drawdown")
 def get_portfolio_drawdown(db: Session = Depends(get_db)):
     return calculate_max_drawdown(db)
+
+@app.get("/portfolio/volatility")
+def get_portfolio_volatility(db: Session = Depends(get_db)):
+    return calculate_volatility(db)
+
+@app.get("/portfolio/sharpe")
+def get_portfolio_sharpe(db: Session = Depends(get_db)):
+    return calculate_sharpe_ratio(db)
+
+
+
+@app.get("/portfolio/rolling-volatility")
+def get_rolling_volatility(window: int = 3, db: Session = Depends(get_db)):
+    return calculate_rolling_volatility(db, window)
+
+
+
+@app.get("/portfolio/beta")
+def get_portfolio_beta(benchmark: str = "^NSEI", db: Session = Depends(get_db)):
+    return calculate_beta(db, benchmark)

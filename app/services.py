@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from app.models import Holding, Price, PortfolioSnapshot
 from datetime import date
 import yfinance as yf
+import math
 
 
 def update_prices(db: Session):
@@ -114,4 +115,135 @@ def calculate_max_drawdown(db: Session):
 
     return {
         "max_drawdown_percent": round(max_drawdown * 100, 2)
+    }
+
+def calculate_volatility(db: Session):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+    if len(snapshots) < 2:
+        return {"message": "Not enough data for volatility calculation"}
+
+    daily_returns = []
+
+    for i in range(1, len(snapshots)):
+        prev = snapshots[i - 1].total_value
+        current = snapshots[i].total_value
+
+        daily_return = (current - prev) / prev
+        daily_returns.append(daily_return)
+
+    mean_return = sum(daily_returns) / len(daily_returns)
+
+    variance = sum((r - mean_return) ** 2 for r in daily_returns) / len(daily_returns)
+
+    volatility = math.sqrt(variance)
+
+    return {
+        "volatility_percent": round(volatility * 100, 2)
+    }
+
+def calculate_sharpe_ratio(db: Session):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+    if len(snapshots) < 2:
+        return {"message": "Not enough data for Sharpe ratio calculation"}
+
+    daily_returns = []
+
+    for i in range(1, len(snapshots)):
+        prev = snapshots[i - 1].total_value
+        current = snapshots[i].total_value
+        daily_return = (current - prev) / prev
+        daily_returns.append(daily_return)
+
+    mean_return = sum(daily_returns) / len(daily_returns)
+
+    variance = sum((r - mean_return) ** 2 for r in daily_returns) / len(daily_returns)
+    volatility = math.sqrt(variance)
+
+    if volatility == 0:
+        return {"message": "Volatility is zero, Sharpe ratio undefined"}
+
+    risk_free_rate = 0  # simplifying assumption
+
+    sharpe_ratio = (mean_return - risk_free_rate) / volatility
+
+    return {
+        "sharpe_ratio": round(sharpe_ratio, 4)
+    }
+
+def calculate_rolling_volatility(db: Session, window: int = 3):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+    if len(snapshots) <= window:
+        return {"message": "Not enough data for rolling calculation"}
+
+    daily_returns = []
+
+    for i in range(1, len(snapshots)):
+        prev = snapshots[i - 1].total_value
+        current = snapshots[i].total_value
+        daily_return = (current - prev) / prev
+        daily_returns.append(daily_return)
+
+    rolling_vol = []
+
+    for i in range(window, len(daily_returns) + 1):
+        window_slice = daily_returns[i - window:i]
+        mean_return = sum(window_slice) / window
+        variance = sum((r - mean_return) ** 2 for r in window_slice) / window
+        vol = math.sqrt(variance)
+        rolling_vol.append(round(vol * 100, 2))
+
+    return {
+        "window": window,
+        "rolling_volatility_percent": rolling_vol
+    }
+
+def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+
+    if len(snapshots) < 2:
+        return {"message": "Not enough data for beta calculation"}
+
+    # Portfolio daily returns
+    portfolio_returns = []
+    for i in range(1, len(snapshots)):
+        prev = snapshots[i - 1].total_value
+        current = snapshots[i].total_value
+        portfolio_returns.append((current - prev) / prev)
+
+    # Fetch benchmark historical data
+    import yfinance as yf
+    import pandas as pd
+
+    start_date = snapshots[0].date
+    end_date = snapshots[-1].date
+
+    benchmark_data = yf.download(benchmark_symbol, start=start_date, end=end_date)
+
+    if len(benchmark_data) < 2:
+        return {"message": "Not enough benchmark data"}
+
+    benchmark_returns = benchmark_data["Close"].pct_change().dropna().tolist()
+
+    # Align lengths (simplified assumption)
+    min_length = min(len(portfolio_returns), len(benchmark_returns))
+    portfolio_returns = portfolio_returns[-min_length:]
+    benchmark_returns = benchmark_returns[-min_length:]
+
+    # Compute covariance and variance
+    import numpy as np
+
+    covariance = np.cov(portfolio_returns, benchmark_returns)[0][1]
+    variance = np.var(benchmark_returns)
+
+    if variance == 0:
+        return {"message": "Benchmark variance is zero"}
+
+    beta = covariance / variance
+
+    return {
+        "benchmark": benchmark_symbol,
+        "beta": round(beta, 4)
     }
