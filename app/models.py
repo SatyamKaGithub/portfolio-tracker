@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Date
+from sqlalchemy import Column, Integer, String, Float, Date, UniqueConstraint
 from app.db import Base
 from datetime import date
 
@@ -12,6 +12,9 @@ class Holding(Base):
 
 class Price(Base):
     __tablename__ = "prices"
+    __table_args__ = (
+        UniqueConstraint("symbol", "date", name="uq_prices_symbol_date"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String, index=True)
@@ -20,6 +23,9 @@ class Price(Base):
 
 class PortfolioSnapshot(Base):
     __tablename__ = "portfolio_snapshots"
+    __table_args__ = (
+        UniqueConstraint("date", name="uq_portfolio_snapshots_date"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     total_value = Column(Float)

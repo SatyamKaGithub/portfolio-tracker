@@ -1,20 +1,22 @@
-from app.services import calculate_portfolio_value, update_prices
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Query
 from sqlalchemy.orm import Session
-from app.db import engine, SessionLocal
-from app.models import Holding
+from app.db import engine, SessionLocal, Base
+from app.models import Holding, PortfolioSnapshot
 from app.schemas import HoldingCreate
-from app.models import PortfolioSnapshot
-from app.services import calculate_performance_metrics
-from app.services import calculate_max_drawdown
-from app.services import calculate_volatility
-from app.services import calculate_sharpe_ratio
-from app.services import calculate_rolling_volatility
-from app.services import calculate_beta
+from app.services import (
+    calculate_beta,
+    calculate_max_drawdown,
+    calculate_performance_metrics,
+    calculate_portfolio_value,
+    calculate_rolling_volatility,
+    calculate_sharpe_ratio,
+    calculate_volatility,
+    update_prices,
+)
 
 app = FastAPI()
 
-Holding.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
 # Dependency to get DB session
 def get_db():
@@ -31,7 +33,7 @@ def root():
 @app.post("/holdings")
 def create_holding(holding: HoldingCreate, db: Session = Depends(get_db)):
     db_holding = Holding(
-        symbol=holding.symbol,
+        symbol=holding.symbol.strip().upper(),
         quantity=holding.quantity,
         avg_price=holding.avg_price
     )
@@ -49,8 +51,8 @@ def get_portfolio_value(db: Session = Depends(get_db)):
 
 @app.post("/prices/update")
 def refresh_prices(db: Session = Depends(get_db)):
-    update_prices(db)
-    return {"message": "Prices updated"}
+    result = update_prices(db)
+    return {"message": "Prices updated", **result}
 
 @app.get("/portfolio/history")
 def get_portfolio_history(db: Session = Depends(get_db)):
@@ -75,7 +77,10 @@ def get_portfolio_sharpe(db: Session = Depends(get_db)):
 
 
 @app.get("/portfolio/rolling-volatility")
-def get_rolling_volatility(window: int = 3, db: Session = Depends(get_db)):
+def get_rolling_volatility(
+    window: int = Query(default=3, ge=2, le=252),
+    db: Session = Depends(get_db)
+):
     return calculate_rolling_volatility(db, window)
 
 
