@@ -32,3 +32,13 @@ class PortfolioSnapshot(Base):
     total_invested = Column(Float)
     pnl = Column(Float)
     date = Column(Date, default=date.today)
+
+class Transaction(Base):
+    __tablename__ = "transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    quantity = Column(Float)
+    price = Column(Float)
+    type = Column(String)  # BUY or SELL
+    date = Column(Date)

@@ -1,9 +1,11 @@
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from typing import List, Union
 from app.db import engine, SessionLocal, Base
 from app.models import Holding, PortfolioSnapshot
 from app.schemas import HoldingCreate
 from app.services import (
+    calculate_alpha,
     calculate_beta,
     calculate_max_drawdown,
     calculate_performance_metrics,
@@ -13,9 +15,12 @@ from app.services import (
     calculate_volatility,
     update_prices,
 )
+from app.schemas import TransactionCreate
+from app.models import Transaction
+from app.services import create_transaction, create_transactions
+
 
 app = FastAPI()
-
 Base.metadata.create_all(bind=engine)
 
 # Dependency to get DB session
@@ -88,3 +93,27 @@ def get_rolling_volatility(
 @app.get("/portfolio/beta")
 def get_portfolio_beta(benchmark: str = "^NSEI", db: Session = Depends(get_db)):
     return calculate_beta(db, benchmark)
+
+
+@app.get("/portfolio/alpha")
+def get_portfolio_alpha(
+    benchmark: str = "^NSEI",
+    db: Session = Depends(get_db)
+):
+    return calculate_alpha(db, benchmark)
+
+@app.post("/transactions")
+def add_transaction(
+    txn: Union[TransactionCreate, List[TransactionCreate]],
+    db: Session = Depends(get_db),
+):
+    try:
+        if isinstance(txn, list):
+            return create_transactions(db, txn)
+        return create_transaction(db, txn)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.get("/transactions")
+def get_transactions(db: Session = Depends(get_db)):
+    return db.query(Transaction).order_by(Transaction.date).all()

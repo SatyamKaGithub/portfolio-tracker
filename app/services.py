@@ -8,7 +8,8 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Holding, PortfolioSnapshot, Price
+from app.models import Holding, PortfolioSnapshot, Price, Transaction
+from app.schemas import TransactionCreate
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -88,6 +89,50 @@ def _build_daily_returns(snapshots: List[PortfolioSnapshot]) -> Dict[date, float
             daily_returns[snapshots[i].date] = daily_return
 
     return daily_returns
+
+
+def _get_holding_by_symbol(db: Session, symbol: str) -> Optional[Holding]:
+    return db.query(Holding).filter(func.upper(Holding.symbol) == symbol).first()
+
+
+def _apply_transaction_to_holdings(
+    db: Session, symbol: str, quantity: float, price: float, txn_type: str
+) -> None:
+    holding = _get_holding_by_symbol(db, symbol)
+
+    if txn_type == "BUY":
+        if not holding:
+            db.add(Holding(symbol=symbol, quantity=quantity, avg_price=price))
+            return
+
+        existing_qty = _safe_number(holding.quantity)
+        existing_avg = _safe_number(holding.avg_price)
+        new_qty = existing_qty + quantity
+        if new_qty <= 0:
+            raise ValueError(f"Invalid resulting quantity for {symbol}")
+        new_avg = ((existing_qty * existing_avg) + (quantity * price)) / new_qty
+        holding.quantity = new_qty
+        holding.avg_price = new_avg
+        return
+
+    if txn_type == "SELL":
+        if not holding:
+            raise ValueError(f"No holdings available to sell for {symbol}")
+
+        existing_qty = _safe_number(holding.quantity)
+        if quantity > existing_qty:
+            raise ValueError(
+                f"Sell quantity {quantity} exceeds available holdings {existing_qty} for {symbol}"
+            )
+
+        remaining_qty = existing_qty - quantity
+        if remaining_qty == 0:
+            db.delete(holding)
+        else:
+            holding.quantity = remaining_qty
+        return
+
+    raise ValueError(f"Unsupported transaction type: {txn_type}")
 
 
 def update_prices(db: Session):
@@ -316,15 +361,21 @@ def calculate_rolling_volatility(db: Session, window: int = 3):
     }
 
 
-def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
+
+def _get_aligned_return_series(db: Session, benchmark_symbol: str = "^NSEI"):
+    """
+    Returns two aligned pandas Series:
+    portfolio_returns, benchmark_returns
+    aligned by common dates.
+    """
     snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
 
     if len(snapshots) < 2:
-        return {"message": "Not enough data for beta calculation"}
+        return None, None
 
     portfolio_returns_by_date = _build_daily_returns(snapshots)
     if len(portfolio_returns_by_date) < 2:
-        return {"message": "Not enough valid portfolio return observations"}
+        return None, None
 
     start_date = min(portfolio_returns_by_date)
     end_date = max(portfolio_returns_by_date) + timedelta(days=1)
@@ -338,41 +389,51 @@ def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
             progress=False,
         )
     except Exception:
-        return {"message": "Failed to fetch benchmark data"}
+        return None, None
 
     if benchmark_data.empty or "Close" not in benchmark_data:
-        return {"message": "Not enough benchmark data"}
+        return None, None
 
     benchmark_close = benchmark_data["Close"]
     if isinstance(benchmark_close, pd.DataFrame):
         if benchmark_close.empty or benchmark_close.shape[1] == 0:
-            return {"message": "Not enough benchmark data"}
+            return None, None
         benchmark_close = benchmark_close.iloc[:, 0]
 
     benchmark_close = pd.to_numeric(benchmark_close, errors="coerce").dropna()
     if benchmark_close.empty:
-        return {"message": "Not enough benchmark data"}
+        return None, None
 
     benchmark_returns = benchmark_close.pct_change().dropna()
     if benchmark_returns.empty:
-        return {"message": "Not enough benchmark data"}
+        return None, None
 
     benchmark_returns.index = pd.to_datetime(benchmark_returns.index).date
+
     portfolio_series = pd.Series(portfolio_returns_by_date, dtype="float64")
     benchmark_series = benchmark_returns.astype("float64")
 
-    common_dates = sorted(set(portfolio_series.index).intersection(set(benchmark_series.index)))
+    common_dates = sorted(
+        set(portfolio_series.index).intersection(set(benchmark_series.index))
+    )
     if len(common_dates) < 2:
-        return {"message": "Not enough overlapping dates with benchmark"}
+        return None, None
 
-    aligned_portfolio = pd.to_numeric(portfolio_series.loc[common_dates], errors="coerce")
-    aligned_benchmark = pd.to_numeric(benchmark_series.loc[common_dates], errors="coerce")
+    aligned_portfolio = portfolio_series.loc[common_dates]
+    aligned_benchmark = benchmark_series.loc[common_dates]
+
     aligned = pd.concat([aligned_portfolio, aligned_benchmark], axis=1).dropna()
     if len(aligned) < 2:
-        return {"message": "Not enough overlapping dates with benchmark"}
+        return None, None
 
-    aligned_portfolio = aligned.iloc[:, 0]
-    aligned_benchmark = aligned.iloc[:, 1]
+    return aligned.iloc[:, 0], aligned.iloc[:, 1]
+
+
+def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+
+    if aligned_portfolio is None:
+        return {"message": "Not enough overlapping dates with benchmark"}
 
     variance = float(aligned_benchmark.var(ddof=1))
     if not math.isfinite(variance) or variance == 0:
@@ -389,5 +450,93 @@ def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
     return {
         "benchmark": benchmark_symbol,
         "beta": round(float(beta), 4),
-        "observations": len(common_dates),
+        "observations": len(aligned_portfolio),
     }
+
+def calculate_alpha(db: Session, benchmark_symbol: str = "^NSEI", risk_free_rate_annual: float = 0.05):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+
+    if aligned_portfolio is None:
+        return {"message": "Not enough overlapping dates with benchmark"}
+
+    portfolio_mean = float(aligned_portfolio.mean())
+    benchmark_mean = float(aligned_benchmark.mean())
+
+    variance = float(aligned_benchmark.var(ddof=1))
+    if not math.isfinite(variance) or variance == 0:
+        return {"message": "Benchmark variance is zero"}
+
+    covariance = float(aligned_portfolio.cov(aligned_benchmark))
+    beta = covariance / variance
+
+    trading_days = 252
+    risk_free_daily = risk_free_rate_annual / trading_days
+
+    expected_return = risk_free_daily + beta * (benchmark_mean - risk_free_daily)
+    alpha = portfolio_mean - expected_return
+
+    return {
+        "benchmark": benchmark_symbol,
+        "alpha_daily": round(alpha, 6),
+        "alpha_annualized": round(alpha * trading_days, 4),
+        "beta": round(beta, 4),
+        "observations": len(aligned_portfolio),
+    }
+
+def create_transaction(db: Session, txn: TransactionCreate):
+    symbol = _normalize_symbol(txn.symbol)
+    txn_type = txn.type.upper()
+    quantity = _safe_number(txn.quantity)
+    price = _safe_number(txn.price)
+
+    transaction = Transaction(
+        symbol=symbol,
+        quantity=quantity,
+        price=price,
+        type=txn_type,
+        date=txn.date or date.today()
+    )
+
+    try:
+        db.add(transaction)
+        _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(transaction)
+
+    return transaction
+
+
+def create_transactions(db: Session, txns: List[TransactionCreate]):
+    transactions: List[Transaction] = []
+
+    try:
+        for txn in txns:
+            symbol = _normalize_symbol(txn.symbol)
+            txn_type = txn.type.upper()
+            quantity = _safe_number(txn.quantity)
+            price = _safe_number(txn.price)
+
+            transaction = Transaction(
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+                type=txn_type,
+                date=txn.date or date.today(),
+            )
+            transactions.append(transaction)
+            db.add(transaction)
+            _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type)
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    for transaction in transactions:
+        db.refresh(transaction)
+
+    return transactions
