@@ -41,4 +41,4 @@ class Transaction(Base):
     quantity = Column(Float)
     price = Column(Float)
     type = Column(String)  # BUY or SELL
-    date = Column(Date)
+    date = Column(Date default=date.today)
