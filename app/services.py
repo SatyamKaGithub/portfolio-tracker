@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from app.models import Holding, PortfolioSnapshot, Price, Transaction
 from app.schemas import TransactionCreate
 
+EPSILON = 1e-9
+
 
 def _normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
@@ -126,7 +128,7 @@ def _apply_transaction_to_holdings(
             )
 
         remaining_qty = existing_qty - quantity
-        if remaining_qty == 0:
+        if remaining_qty <= EPSILON:
             db.delete(holding)
         else:
             holding.quantity = remaining_qty
@@ -251,6 +253,34 @@ def calculate_performance_metrics(db: Session):
         "start_value": start_value,
         "latest_value": latest_value,
         "absolute_return_percent": round(absolute_return_percent, 2),
+    }
+
+
+def calculate_daily_returns(db: Session, limit: Optional[int] = None):
+    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date.asc()).all()
+
+    if len(snapshots) < 2:
+        return {"message": "Not enough data for daily return calculation"}
+
+    daily_returns_by_date = _build_daily_returns(snapshots)
+    if not daily_returns_by_date:
+        return {"message": "Not enough valid return observations"}
+
+    rows = [
+        {
+            "date": snapshot_date.isoformat(),
+            "daily_return": round(daily_return, 6),
+            "daily_return_percent": round(daily_return * 100, 4),
+        }
+        for snapshot_date, daily_return in sorted(daily_returns_by_date.items())
+    ]
+
+    if limit is not None:
+        rows = rows[-limit:]
+
+    return {
+        "observations": len(rows),
+        "daily_returns": rows,
     }
 
 
@@ -483,6 +513,60 @@ def calculate_alpha(db: Session, benchmark_symbol: str = "^NSEI", risk_free_rate
         "observations": len(aligned_portfolio),
     }
 
+
+def calculate_information_ratio(db: Session, benchmark_symbol: str = "^NSEI"):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+
+    if aligned_portfolio is None:
+        return {"message": "Not enough overlapping dates with benchmark"}
+
+    active_returns = aligned_portfolio - aligned_benchmark
+    if len(active_returns) < 2:
+        return {"message": "Not enough valid return observations"}
+
+    mean_active_return = float(active_returns.mean())
+    tracking_error = float(active_returns.std(ddof=1))
+
+    if not math.isfinite(tracking_error) or tracking_error == 0:
+        return {"message": "Tracking error is zero"}
+
+    information_ratio = mean_active_return / tracking_error
+    if not math.isfinite(information_ratio):
+        return {"message": "Could not compute information ratio"}
+
+    trading_days = 252
+    return {
+        "benchmark": benchmark_symbol,
+        "information_ratio_daily": round(information_ratio, 6),
+        "information_ratio_annualized": round(information_ratio * math.sqrt(trading_days), 4),
+        "mean_active_return_daily": round(mean_active_return, 6),
+        "tracking_error_daily": round(tracking_error, 6),
+        "observations": len(active_returns),
+    }
+
+
+def calculate_tracking_error(db: Session, benchmark_symbol: str = "^NSEI"):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+
+    if aligned_portfolio is None:
+        return {"message": "Not enough overlapping dates with benchmark"}
+
+    active_returns = aligned_portfolio - aligned_benchmark
+    if len(active_returns) < 2:
+        return {"message": "Not enough valid return observations"}
+
+    tracking_error_daily = float(active_returns.std(ddof=1))
+    if not math.isfinite(tracking_error_daily):
+        return {"message": "Could not compute tracking error"}
+
+    trading_days = 252
+    return {
+        "benchmark": benchmark_symbol,
+        "tracking_error_daily": round(tracking_error_daily, 6),
+        "tracking_error_annualized": round(tracking_error_daily * math.sqrt(trading_days), 4),
+        "observations": len(active_returns),
+    }
+
 def create_transaction(db: Session, txn: TransactionCreate):
     symbol = _normalize_symbol(txn.symbol)
     txn_type = txn.type.upper()
@@ -540,3 +624,60 @@ def create_transactions(db: Session, txns: List[TransactionCreate]):
         db.refresh(transaction)
 
     return transactions
+
+def calculate_holdings_from_transactions(db: Session, as_of: Optional[date] = None):
+    cutoff = as_of or date.today()
+
+    transactions = db.query(Transaction).filter(
+        Transaction.date <= cutoff
+    ).order_by(Transaction.date.asc(), Transaction.id.asc()).all()
+
+    holdings: Dict[str, float] = {}
+    negative_symbols: List[str] = []
+
+    for txn in transactions:
+        symbol = _normalize_symbol(txn.symbol) if txn.symbol else ""
+        if not symbol:
+            continue
+        qty = _safe_number(txn.quantity)
+
+        if txn.type == "BUY":
+            holdings[symbol] = holdings.get(symbol, 0) + qty
+        elif txn.type == "SELL":
+            holdings[symbol] = holdings.get(symbol, 0) - qty
+            if holdings[symbol] < -EPSILON:
+                negative_symbols.append(symbol)
+
+    # Keep only open long positions in the holdings map.
+    # Negative positions are tracked separately for reconciliation/debugging.
+    holdings = {s: q for s, q in holdings.items() if q > EPSILON}
+
+    return {
+        "holdings": holdings,
+        "negative_symbols": sorted(set(negative_symbols)),
+    }
+
+def portfolio_value_from_ledger(db: Session, as_of: Optional[date] = None):
+    ledger = calculate_holdings_from_transactions(db, as_of)
+    holdings = ledger["holdings"]
+    negative_symbols = ledger["negative_symbols"]
+
+    total_value = 0
+    missing_price_symbols: List[str] = []
+
+    for symbol, quantity in holdings.items():
+        price_record = db.query(Price).filter(
+            func.upper(Price.symbol) == symbol,
+            Price.date <= (as_of or date.today())
+        ).order_by(Price.date.desc()).first()
+
+        if price_record:
+            total_value += quantity * price_record.price
+        else:
+            missing_price_symbols.append(symbol)
+
+    return {
+        "total_value": total_value,
+        "missing_price_symbols": sorted(set(missing_price_symbols)),
+        "negative_symbols": negative_symbols,
+    }

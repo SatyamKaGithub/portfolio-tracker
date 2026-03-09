@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Union
 from app.db import engine, SessionLocal, Base
 from app.models import Holding, PortfolioSnapshot
@@ -7,11 +8,14 @@ from app.schemas import HoldingCreate
 from app.services import (
     calculate_alpha,
     calculate_beta,
+    calculate_daily_returns,
+    calculate_information_ratio,
     calculate_max_drawdown,
     calculate_performance_metrics,
     calculate_portfolio_value,
     calculate_rolling_volatility,
     calculate_sharpe_ratio,
+    calculate_tracking_error,
     calculate_volatility,
     update_prices,
 )
@@ -22,6 +26,13 @@ from app.services import create_transaction, create_transactions
 
 app = FastAPI()
 Base.metadata.create_all(bind=engine)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Dependency to get DB session
 def get_db():
@@ -66,6 +77,14 @@ def get_portfolio_history(db: Session = Depends(get_db)):
 @app.get("/portfolio/performance")
 def get_portfolio_performance(db: Session = Depends(get_db)):
     return calculate_performance_metrics(db)
+
+
+@app.get("/portfolio/daily-returns")
+def get_portfolio_daily_returns(
+    limit: int = Query(default=30, ge=1, le=5000),
+    db: Session = Depends(get_db)
+):
+    return calculate_daily_returns(db, limit=limit)
     
 @app.get("/portfolio/drawdown")
 def get_portfolio_drawdown(db: Session = Depends(get_db)):
@@ -102,6 +121,22 @@ def get_portfolio_alpha(
 ):
     return calculate_alpha(db, benchmark)
 
+
+@app.get("/portfolio/information-ratio")
+def get_portfolio_information_ratio(
+    benchmark: str = "^NSEI",
+    db: Session = Depends(get_db)
+):
+    return calculate_information_ratio(db, benchmark)
+
+
+@app.get("/portfolio/tracking-error")
+def get_portfolio_tracking_error(
+    benchmark: str = "^NSEI",
+    db: Session = Depends(get_db)
+):
+    return calculate_tracking_error(db, benchmark)
+
 @app.post("/transactions")
 def add_transaction(
     txn: Union[TransactionCreate, List[TransactionCreate]],
@@ -116,4 +151,4 @@ def add_transaction(
 
 @app.get("/transactions")
 def get_transactions(db: Session = Depends(get_db)):
-    return db.query(Transaction).order_by(Transaction.date).all()
+    return db.query(Transaction).order_by(Transaction.date.asc(), Transaction.id.asc()).all()
