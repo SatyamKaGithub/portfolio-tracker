@@ -111,6 +111,26 @@ export async function refreshImportedHoldings() {
   })
 }
 
+export async function applyImportedHoldingTransaction(payload) {
+  return request("/imports/holdings/transactions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function addRecurringSip(payload) {
+  return request("/imports/holdings/sips", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
 export async function getImportedDashboard(category = "ALL") {
   return request(
     `/portfolio/imported-dashboard?category=${encodeURIComponent(category)}`

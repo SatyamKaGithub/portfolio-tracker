@@ -33,6 +33,19 @@ class PortfolioSnapshot(Base):
     pnl = Column(Float)
     date = Column(Date, default=date.today)
 
+
+class ImportedPortfolioSnapshot(Base):
+    __tablename__ = "imported_portfolio_snapshots"
+    __table_args__ = (
+        UniqueConstraint("date", name="uq_imported_portfolio_snapshots_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    total_value = Column(Float)
+    total_invested = Column(Float)
+    pnl = Column(Float)
+    date = Column(Date, default=date.today)
+
 class Transaction(Base):
     __tablename__ = "transactions"
 
@@ -67,3 +80,28 @@ class ImportedHolding(Base):
     currency = Column(String, default="INR")
     source_file = Column(String, nullable=True)
     imported_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ImportedHoldingTransaction(Base):
+    __tablename__ = "imported_holding_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    quantity = Column(Float)
+    price = Column(Float)
+    type = Column(String)  # BUY or SELL
+    date = Column(Date, default=date.today)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class RecurringSip(Base):
+    __tablename__ = "recurring_sips"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    amount = Column(Float)
+    start_date = Column(Date, default=date.today)
+    next_run_date = Column(Date, default=date.today, index=True)
+    day_of_month = Column(Integer)
+    active = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

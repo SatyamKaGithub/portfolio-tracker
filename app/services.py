@@ -9,8 +9,22 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.importers import decode_base64_document, parse_xlsx_holdings
-from app.models import Holding, ImportedHolding, PortfolioSnapshot, Price, Transaction
-from app.schemas import HoldingsImportPayload, TransactionCreate
+from app.models import (
+    Holding,
+    ImportedHolding,
+    ImportedPortfolioSnapshot,
+    ImportedHoldingTransaction,
+    RecurringSip,
+    PortfolioSnapshot,
+    Price,
+    Transaction,
+)
+from app.schemas import (
+    HoldingsImportPayload,
+    ImportedHoldingTransactionCreate,
+    RecurringSipCreate,
+    TransactionCreate,
+)
 
 EPSILON = 1e-9
 
@@ -50,23 +64,30 @@ def _fetch_latest_close(symbol: str) -> Optional[float]:
 
 
 def _upsert_portfolio_snapshot(
-    db: Session, snapshot_date: date, portfolio_data: Dict[str, float]
+    db: Session,
+    snapshot_date: date,
+    portfolio_data: Dict[str, float],
+    overwrite: bool = False,
 ) -> bool:
     existing_snapshot = db.query(PortfolioSnapshot).filter(
         PortfolioSnapshot.date == snapshot_date
     ).first()
 
     if existing_snapshot:
-        return False
-
-    db.add(
-        PortfolioSnapshot(
-            total_value=portfolio_data["total_current_value"],
-            total_invested=portfolio_data["total_invested"],
-            pnl=portfolio_data["total_pnl"],
-            date=snapshot_date,
+        if not overwrite:
+            return False
+        existing_snapshot.total_value = portfolio_data["total_current_value"]
+        existing_snapshot.total_invested = portfolio_data["total_invested"]
+        existing_snapshot.pnl = portfolio_data["total_pnl"]
+    else:
+        db.add(
+            PortfolioSnapshot(
+                total_value=portfolio_data["total_current_value"],
+                total_invested=portfolio_data["total_invested"],
+                pnl=portfolio_data["total_pnl"],
+                date=snapshot_date,
+            )
         )
-    )
 
     try:
         db.commit()
@@ -75,6 +96,15 @@ def _upsert_portfolio_snapshot(
         return False
 
     return True
+
+
+def _add_months(base_date: date, months: int = 1) -> date:
+    month_index = base_date.month - 1 + months
+    year = base_date.year + month_index // 12
+    month = month_index % 12 + 1
+    month_lengths = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day = min(base_date.day, month_lengths[month - 1])
+    return date(year, month, day)
 
 
 def _build_daily_returns(snapshots: List[PortfolioSnapshot]) -> Dict[date, float]:
@@ -92,6 +122,10 @@ def _build_daily_returns(snapshots: List[PortfolioSnapshot]) -> Dict[date, float
             daily_returns[snapshots[i].date] = daily_return
 
     return daily_returns
+
+
+def _build_daily_returns_from_rows(snapshots) -> Dict[date, float]:
+    return _build_daily_returns(list(snapshots))
 
 
 def _get_holding_by_symbol(db: Session, symbol: str) -> Optional[Holding]:
@@ -460,6 +494,66 @@ def _get_aligned_return_series(db: Session, benchmark_symbol: str = "^NSEI"):
     return aligned.iloc[:, 0], aligned.iloc[:, 1]
 
 
+def _get_aligned_return_series_for_snapshots(
+    snapshots,
+    benchmark_symbol: str = "^NSEI",
+):
+    if len(snapshots) < 2:
+        return None, None
+
+    portfolio_returns_by_date = _build_daily_returns_from_rows(snapshots)
+    if len(portfolio_returns_by_date) < 2:
+        return None, None
+
+    start_date = min(portfolio_returns_by_date)
+    end_date = max(portfolio_returns_by_date) + timedelta(days=1)
+
+    try:
+        benchmark_data = yf.download(
+            benchmark_symbol,
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        return None, None
+
+    if benchmark_data.empty or "Close" not in benchmark_data:
+        return None, None
+
+    benchmark_close = benchmark_data["Close"]
+    if isinstance(benchmark_close, pd.DataFrame):
+        if benchmark_close.empty or benchmark_close.shape[1] == 0:
+            return None, None
+        benchmark_close = benchmark_close.iloc[:, 0]
+
+    benchmark_close = pd.to_numeric(benchmark_close, errors="coerce").dropna()
+    if benchmark_close.empty:
+        return None, None
+
+    benchmark_returns = benchmark_close.pct_change().dropna()
+    if benchmark_returns.empty:
+        return None, None
+
+    benchmark_returns.index = pd.to_datetime(benchmark_returns.index).date
+
+    portfolio_series = pd.Series(portfolio_returns_by_date, dtype="float64")
+    benchmark_series = benchmark_returns.astype("float64")
+
+    common_dates = sorted(set(portfolio_series.index).intersection(set(benchmark_series.index)))
+    if len(common_dates) < 2:
+        return None, None
+
+    aligned_portfolio = portfolio_series.loc[common_dates]
+    aligned_benchmark = benchmark_series.loc[common_dates]
+    aligned = pd.concat([aligned_portfolio, aligned_benchmark], axis=1).dropna()
+    if len(aligned) < 2:
+        return None, None
+
+    return aligned.iloc[:, 0], aligned.iloc[:, 1]
+
+
 def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
     aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
 
@@ -781,6 +875,31 @@ def _fetch_quote_snapshot(holding: ImportedHolding) -> Dict[str, Optional[float]
     return {}
 
 
+def _fetch_close_for_date(holding: ImportedHolding, target_date: date) -> Optional[float]:
+    for candidate in _candidate_market_symbols(holding):
+        try:
+            history = yf.Ticker(candidate).history(
+                start=target_date,
+                end=target_date + timedelta(days=7),
+                auto_adjust=False,
+            )
+        except Exception:
+            continue
+
+        if history.empty or "Close" not in history:
+            continue
+
+        closes = pd.to_numeric(history["Close"], errors="coerce").dropna()
+        if closes.empty:
+            continue
+
+        price = float(closes.iloc[0])
+        if math.isfinite(price) and price > 0:
+            return price
+
+    return None
+
+
 def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
     file_bytes = decode_base64_document(payload.content_base64)
     workbook = parse_xlsx_holdings(file_bytes)
@@ -837,6 +956,7 @@ def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
 
     db.commit()
     refresh_imported_holdings_market_data(db)
+    _upsert_imported_portfolio_snapshot(db, imported_at.date(), overwrite=True)
 
     return {
         "message": "Holdings imported successfully",
@@ -884,11 +1004,134 @@ def refresh_imported_holdings_market_data(db: Session):
         updated += 1
 
     db.commit()
+    snapshot_created = _upsert_imported_portfolio_snapshot(db)
 
     return {
         "message": "Imported holdings refreshed",
         "updated_count": updated,
         "failed_symbols": failed_symbols,
+        "snapshot_created": snapshot_created,
+    }
+
+
+def _refresh_single_imported_holding(holding: ImportedHolding) -> None:
+    snapshot = _fetch_quote_snapshot(holding)
+    quantity = _safe_number(holding.quantity)
+
+    current_price = _first_finite(
+        snapshot.get("current_price") if snapshot else None,
+        holding.current_price,
+    )
+    prev_close = _first_finite(
+        snapshot.get("prev_close") if snapshot else None,
+        holding.prev_close,
+    )
+
+    if snapshot:
+        holding.exchange_symbol = str(snapshot.get("exchange_symbol") or holding.exchange_symbol or "")
+        holding.company_name = str(snapshot.get("company_name") or holding.company_name or "")
+        holding.sector = str(snapshot.get("sector") or holding.sector or "")
+        holding.geography = str(snapshot.get("geography") or holding.geography or "India")
+        holding.pe_ratio = _first_finite(snapshot.get("pe_ratio"), holding.pe_ratio)
+
+        quote_type = str(snapshot.get("quote_type") or "").strip().upper()
+        if quote_type == "ETF":
+            holding.asset_type = "ETF"
+        elif quote_type in {"MUTUALFUND", "MUTUAL FUND"}:
+            holding.asset_type = "MUTUAL_FUND"
+
+    holding.current_price = current_price
+    holding.prev_close = prev_close
+    holding.current_value = quantity * current_price if current_price is not None else quantity * _safe_number(holding.avg_buy_cost)
+    if current_price is not None and prev_close is not None:
+        holding.one_day_change = quantity * (current_price - prev_close)
+    else:
+        holding.one_day_change = 0.0
+    holding.unrealized_pnl = _safe_number(holding.current_value) - _safe_number(holding.invested_amount)
+
+
+def apply_imported_holding_transaction(db: Session, txn: ImportedHoldingTransactionCreate):
+    symbol = _normalize_symbol(txn.symbol)
+    txn_type = txn.type.upper()
+    quantity = _safe_number(txn.quantity)
+    price = _safe_number(txn.price)
+    txn_date = txn.date or date.today()
+
+    holding = db.query(ImportedHolding).filter(
+        func.upper(ImportedHolding.symbol) == symbol
+    ).first()
+
+    if not holding:
+        raise ValueError(f"No imported holding found for {symbol}")
+
+    existing_qty = _safe_number(holding.quantity)
+    existing_avg = _safe_number(holding.avg_buy_cost)
+    existing_invested = _safe_number(holding.invested_amount)
+
+    manual_txn = ImportedHoldingTransaction(
+        symbol=symbol,
+        quantity=quantity,
+        price=price,
+        type=txn_type,
+        date=txn_date,
+    )
+    db.add(manual_txn)
+
+    if txn_type == "BUY":
+        new_qty = existing_qty + quantity
+        if new_qty <= 0:
+            raise ValueError(f"Invalid resulting quantity for {symbol}")
+        new_invested = existing_invested + (quantity * price)
+        holding.quantity = new_qty
+        holding.invested_amount = round(new_invested, 2)
+        holding.avg_buy_cost = round(new_invested / new_qty, 2)
+        _refresh_single_imported_holding(holding)
+        holding.imported_at = datetime.utcnow()
+    elif txn_type == "SELL":
+        if quantity > existing_qty:
+            raise ValueError(
+                f"Sell quantity {quantity} exceeds available holdings {existing_qty} for {symbol}"
+            )
+
+        remaining_qty = existing_qty - quantity
+        remaining_invested = max(existing_invested - (quantity * price), 0.0)
+
+        if remaining_qty <= EPSILON:
+            db.delete(holding)
+        else:
+            holding.quantity = remaining_qty
+            holding.invested_amount = round(remaining_invested, 2)
+            holding.avg_buy_cost = round(remaining_invested / remaining_qty, 2) if remaining_qty else 0.0
+            _refresh_single_imported_holding(holding)
+            holding.imported_at = datetime.utcnow()
+    else:
+        raise ValueError(f"Unsupported transaction type: {txn_type}")
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    _upsert_imported_portfolio_snapshot(
+        db,
+        snapshot_date=txn_date,
+        allow_empty=True,
+        overwrite=True,
+    )
+    if txn_date != date.today():
+        _upsert_imported_portfolio_snapshot(
+            db,
+            snapshot_date=date.today(),
+            allow_empty=True,
+            overwrite=True,
+        )
+
+    return {
+        "message": f"{txn_type.title()} transaction recorded for {symbol}",
+        "symbol": symbol,
+        "type": txn_type,
+        "date": txn_date.isoformat(),
     }
 
 
@@ -979,7 +1222,599 @@ def _fetch_benchmark_summary(symbol: str = "^NSEI") -> Dict[str, object]:
     }
 
 
+def _imported_portfolio_totals(holdings: List[ImportedHolding]) -> Dict[str, float]:
+    total_current_value = 0.0
+    total_invested = 0.0
+    total_pnl = 0.0
+
+    for holding in holdings:
+        current_value = _safe_number(holding.current_value)
+        invested_amount = _safe_number(holding.invested_amount)
+        total_current_value += current_value
+        total_invested += invested_amount
+        total_pnl += current_value - invested_amount
+
+    return {
+        "total_current_value": round(total_current_value, 2),
+        "total_invested": round(total_invested, 2),
+        "total_pnl": round(total_pnl, 2),
+    }
+
+
+def _upsert_imported_holdings_snapshot(
+    db: Session,
+    snapshot_date: Optional[date] = None,
+    allow_empty: bool = False,
+    overwrite: bool = False,
+) -> bool:
+    holdings = db.query(ImportedHolding).all()
+    if not holdings and not allow_empty:
+        return False
+
+    portfolio_data = (
+        _imported_portfolio_totals(holdings)
+        if holdings
+        else {
+            "total_current_value": 0.0,
+            "total_invested": 0.0,
+            "total_pnl": 0.0,
+        }
+    )
+
+    return _upsert_portfolio_snapshot(
+        db,
+        snapshot_date or date.today(),
+        portfolio_data,
+        overwrite=overwrite,
+    )
+
+
+def _upsert_imported_portfolio_snapshot(
+    db: Session,
+    snapshot_date: Optional[date] = None,
+    allow_empty: bool = False,
+    overwrite: bool = False,
+) -> bool:
+    holdings = db.query(ImportedHolding).all()
+    if not holdings and not allow_empty:
+        return False
+
+    portfolio_data = (
+        _imported_portfolio_totals(holdings)
+        if holdings
+        else {
+            "total_current_value": 0.0,
+            "total_invested": 0.0,
+            "total_pnl": 0.0,
+        }
+    )
+
+    target_date = snapshot_date or date.today()
+    existing_snapshot = db.query(ImportedPortfolioSnapshot).filter(
+        ImportedPortfolioSnapshot.date == target_date
+    ).first()
+
+    if existing_snapshot:
+        if not overwrite:
+            return False
+        existing_snapshot.total_value = portfolio_data["total_current_value"]
+        existing_snapshot.total_invested = portfolio_data["total_invested"]
+        existing_snapshot.pnl = portfolio_data["total_pnl"]
+    else:
+        db.add(
+            ImportedPortfolioSnapshot(
+                total_value=portfolio_data["total_current_value"],
+                total_invested=portfolio_data["total_invested"],
+                pnl=portfolio_data["total_pnl"],
+                date=target_date,
+            )
+        )
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return False
+
+    return True
+
+
+def _ensure_imported_snapshot_history(db: Session) -> None:
+    existing_count = db.query(ImportedPortfolioSnapshot).count()
+    if existing_count > 0:
+        return
+
+    latest_import = db.query(ImportedHolding).order_by(ImportedHolding.imported_at.desc()).first()
+    import_cutoff = latest_import.imported_at.date() if latest_import and latest_import.imported_at else None
+
+    query = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date.asc())
+    if import_cutoff:
+        query = query.filter(PortfolioSnapshot.date >= import_cutoff)
+
+    legacy_snapshots = query.all()
+    if legacy_snapshots:
+        for snapshot in legacy_snapshots:
+            db.add(
+                ImportedPortfolioSnapshot(
+                    total_value=snapshot.total_value,
+                    total_invested=snapshot.total_invested,
+                    pnl=snapshot.pnl,
+                    date=snapshot.date,
+                )
+            )
+        try:
+            db.commit()
+            return
+        except IntegrityError:
+            db.rollback()
+
+    _upsert_imported_portfolio_snapshot(db, allow_empty=True, overwrite=True)
+
+
+def _fetch_benchmark_mini_chart(symbol: str, fallback_name: str) -> Dict[str, object]:
+    try:
+        ticker = yf.Ticker(symbol)
+        intraday_history = ticker.history(period="2d", interval="15m", auto_adjust=False)
+        daily_history = ticker.history(period="5d", auto_adjust=False)
+    except Exception:
+        return {
+            "symbol": symbol,
+            "name": fallback_name,
+            "current_level": None,
+            "prev_close": None,
+            "points_change": None,
+            "change_percent": None,
+            "trend": None,
+            "points": [],
+        }
+
+    if intraday_history.empty or "Close" not in intraday_history:
+        return {
+            "symbol": symbol,
+            "name": fallback_name,
+            "current_level": None,
+            "prev_close": None,
+            "points_change": None,
+            "change_percent": None,
+            "trend": None,
+            "points": [],
+        }
+
+    closes = pd.to_numeric(intraday_history["Close"], errors="coerce").dropna()
+    if closes.empty:
+        return {
+            "symbol": symbol,
+            "name": fallback_name,
+            "current_level": None,
+            "prev_close": None,
+            "points_change": None,
+            "change_percent": None,
+            "trend": None,
+            "points": [],
+        }
+
+    intraday_dates = pd.to_datetime(closes.index).date
+    latest_session_date = max(intraday_dates)
+    closes = closes[[current_date == latest_session_date for current_date in intraday_dates]]
+    if closes.empty:
+        return {
+            "symbol": symbol,
+            "name": fallback_name,
+            "current_level": None,
+            "prev_close": None,
+            "points_change": None,
+            "change_percent": None,
+            "trend": None,
+            "points": [],
+        }
+
+    daily_closes = (
+        pd.to_numeric(daily_history["Close"], errors="coerce").dropna()
+        if not daily_history.empty and "Close" in daily_history
+        else pd.Series(dtype="float64")
+    )
+    daily_dates = [pd.to_datetime(index).date() for index in daily_closes.index]
+    prev_close = None
+    if len(daily_closes) >= 2 and daily_dates[-1] == latest_session_date:
+        prev_close = float(daily_closes.iloc[-2])
+    elif len(daily_closes) >= 1 and daily_dates[-1] < latest_session_date:
+        prev_close = float(daily_closes.iloc[-1])
+    elif len(closes) >= 1:
+        prev_close = float(closes.iloc[0])
+
+    summary_level = float(daily_closes.iloc[-1]) if len(daily_closes) >= 1 else float(closes.iloc[-1])
+    intraday_last = float(closes.iloc[-1])
+    current_level = summary_level
+    points_change = current_level - prev_close if prev_close else None
+    change_percent = ((current_level - prev_close) / prev_close) * 100 if prev_close else None
+    trend = "positive" if (points_change or 0) >= 0 else "negative"
+
+    adjustment = current_level - intraday_last
+    adjusted_closes = closes + adjustment
+
+    points = [
+        {
+            "date": pd.to_datetime(index).isoformat(),
+            "value": round(float(value), 2),
+        }
+        for index, value in adjusted_closes.items()
+    ]
+
+    return {
+        "symbol": symbol,
+        "name": fallback_name,
+        "current_level": round(current_level, 2),
+        "prev_close": round(prev_close, 2) if prev_close else None,
+        "points_change": round(points_change, 2) if points_change is not None else None,
+        "change_percent": round(change_percent, 2) if change_percent is not None else None,
+        "trend": trend,
+        "points": points,
+    }
+
+
+def _calculate_imported_risk_metrics(db: Session, benchmark_symbol: str = "^NSEI") -> Dict[str, object]:
+    snapshots = db.query(ImportedPortfolioSnapshot).order_by(ImportedPortfolioSnapshot.date.asc()).all()
+    daily_returns = list(_build_daily_returns_from_rows(snapshots).values())
+
+    sharpe_ratio = None
+    if len(daily_returns) >= 2:
+        mean_return = sum(daily_returns) / len(daily_returns)
+        variance = sum((r - mean_return) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
+        volatility = math.sqrt(variance)
+        if volatility != 0:
+            sharpe_ratio = round(mean_return / volatility, 4)
+
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series_for_snapshots(
+        snapshots,
+        benchmark_symbol,
+    )
+    beta = None
+    alpha_annualized_percent = None
+    observations = len(daily_returns)
+
+    if aligned_portfolio is not None:
+        variance = float(aligned_benchmark.var(ddof=1))
+        if math.isfinite(variance) and variance != 0:
+            covariance = float(aligned_portfolio.cov(aligned_benchmark))
+            if math.isfinite(covariance):
+                beta_value = covariance / variance
+                if math.isfinite(beta_value):
+                    beta = round(float(beta_value), 4)
+
+                    portfolio_mean = float(aligned_portfolio.mean())
+                    benchmark_mean = float(aligned_benchmark.mean())
+                    trading_days = 252
+                    risk_free_daily = 0.05 / trading_days
+                    expected_return = risk_free_daily + beta_value * (benchmark_mean - risk_free_daily)
+                    alpha_daily = portfolio_mean - expected_return
+                    alpha_annualized_percent = round(alpha_daily * trading_days * 100, 2)
+                    observations = len(aligned_portfolio)
+
+    return {
+        "sharpe_ratio": sharpe_ratio,
+        "beta": beta,
+        "alpha_annualized_percent": alpha_annualized_percent,
+        "observations": observations,
+    }
+
+
+def _apply_imported_buy(
+    db: Session,
+    holding: ImportedHolding,
+    quantity: float,
+    price: float,
+    txn_date: date,
+    record_label: str = "BUY",
+) -> None:
+    existing_qty = _safe_number(holding.quantity)
+    existing_invested = _safe_number(holding.invested_amount)
+    new_qty = existing_qty + quantity
+    new_invested = existing_invested + (quantity * price)
+    holding.quantity = new_qty
+    holding.invested_amount = round(new_invested, 2)
+    holding.avg_buy_cost = round(new_invested / new_qty, 2)
+    _refresh_single_imported_holding(holding)
+    holding.imported_at = datetime.utcnow()
+
+    db.add(
+        ImportedHoldingTransaction(
+            symbol=_normalize_symbol(holding.symbol),
+            quantity=quantity,
+            price=price,
+            type=record_label,
+            date=txn_date,
+        )
+    )
+
+
+def process_due_sips(db: Session) -> Dict[str, int]:
+    today = date.today()
+    sips = db.query(RecurringSip).filter(
+        RecurringSip.active == 1,
+        RecurringSip.next_run_date <= today,
+    ).order_by(RecurringSip.next_run_date.asc(), RecurringSip.id.asc()).all()
+
+    processed = 0
+
+    for sip in sips:
+        holding = db.query(ImportedHolding).filter(
+            func.upper(ImportedHolding.symbol) == _normalize_symbol(sip.symbol)
+        ).first()
+        if not holding:
+            continue
+
+        run_date = sip.next_run_date
+        while run_date <= today:
+            _refresh_single_imported_holding(holding)
+            unit_price = _first_finite(
+                _fetch_close_for_date(holding, run_date),
+                holding.current_price,
+                holding.avg_buy_cost,
+            )
+            if not unit_price or unit_price <= 0:
+                break
+
+            quantity = sip.amount / unit_price
+            _apply_imported_buy(
+                db,
+                holding,
+                quantity=quantity,
+                price=unit_price,
+                txn_date=run_date,
+                record_label="SIP_BUY",
+            )
+            processed += 1
+            sip.next_run_date = _add_months(run_date.replace(day=min(sip.day_of_month, 28)))
+            target_month_date = _add_months(run_date.replace(day=1), 1)
+            month_lengths = [31, 29 if target_month_date.year % 4 == 0 and (target_month_date.year % 100 != 0 or target_month_date.year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            sip.next_run_date = date(
+                target_month_date.year,
+                target_month_date.month,
+                min(sip.day_of_month, month_lengths[target_month_date.month - 1]),
+            )
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                break
+            _upsert_imported_portfolio_snapshot(
+                db,
+                snapshot_date=run_date,
+                allow_empty=True,
+                overwrite=True,
+            )
+            run_date = sip.next_run_date
+
+    return {"processed_sips": processed}
+
+
+def create_recurring_sip(db: Session, payload: RecurringSipCreate):
+    holding = db.query(ImportedHolding).filter(
+        func.upper(ImportedHolding.symbol) == _normalize_symbol(payload.symbol)
+    ).first()
+    if not holding:
+        raise ValueError(f"No imported mutual fund found for {payload.symbol}")
+
+    if _normalize_asset_type(holding.asset_type) != "MUTUAL_FUND":
+        raise ValueError("Recurring SIP is currently supported only for mutual funds")
+
+    sip = RecurringSip(
+        symbol=_normalize_symbol(payload.symbol),
+        amount=_safe_number(payload.amount),
+        start_date=payload.start_date,
+        next_run_date=payload.start_date,
+        day_of_month=payload.start_date.day,
+        active=1,
+    )
+    db.add(sip)
+    db.commit()
+    db.refresh(sip)
+    process_due_sips(db)
+
+    return {
+        "id": sip.id,
+        "symbol": sip.symbol,
+        "amount": round(sip.amount, 2),
+        "start_date": sip.start_date.isoformat(),
+        "next_run_date": sip.next_run_date.isoformat(),
+        "day_of_month": sip.day_of_month,
+        "active": bool(sip.active),
+    }
+
+
+def _build_normalized_performance_comparison(
+    db: Session,
+    benchmark_symbol: str = "^NSEI",
+    snapshot_model=PortfolioSnapshot,
+) -> Dict[str, object]:
+    snapshots = db.query(snapshot_model).order_by(snapshot_model.date.asc()).all()
+    if snapshot_model is ImportedPortfolioSnapshot and len(snapshots) < 2:
+        holdings = db.query(ImportedHolding).all()
+        total_current_value = sum(_safe_number(holding.current_value) for holding in holdings)
+        total_one_day_change = sum(_safe_number(holding.one_day_change) for holding in holdings)
+        previous_value = total_current_value - total_one_day_change
+        if previous_value <= 0:
+            previous_value = sum(_safe_number(holding.invested_amount) for holding in holdings)
+
+        try:
+            benchmark_history = yf.Ticker(benchmark_symbol).history(period="5d", auto_adjust=True)
+        except Exception:
+            benchmark_history = pd.DataFrame()
+
+        if (
+            not benchmark_history.empty
+            and "Close" in benchmark_history
+            and total_current_value > 0
+            and previous_value > 0
+        ):
+            benchmark_close = pd.to_numeric(benchmark_history["Close"], errors="coerce").dropna()
+            if len(benchmark_close) >= 2:
+                start_date = pd.to_datetime(benchmark_close.index[-2]).date()
+                end_date = pd.to_datetime(benchmark_close.index[-1]).date()
+                benchmark_start = float(benchmark_close.iloc[-2])
+                benchmark_end = float(benchmark_close.iloc[-1])
+                if benchmark_start > 0 and benchmark_end > 0:
+                    return {
+                        "benchmark": benchmark_symbol,
+                        "points": [
+                            {
+                                "date": start_date.isoformat(),
+                                "portfolio_value": 100.0,
+                                "benchmark_value": 100.0,
+                                "portfolio_change_percent": 0.0,
+                                "benchmark_change_percent": 0.0,
+                            },
+                            {
+                                "date": end_date.isoformat(),
+                                "portfolio_value": round((total_current_value / previous_value) * 100, 2),
+                                "benchmark_value": round((benchmark_end / benchmark_start) * 100, 2),
+                                "portfolio_change_percent": round(((total_current_value / previous_value) * 100) - 100, 2),
+                                "benchmark_change_percent": round(((benchmark_end / benchmark_start) * 100) - 100, 2),
+                            },
+                        ],
+                        "start_date": start_date.isoformat(),
+                        "end_date": end_date.isoformat(),
+                        "observations": 2,
+                    }
+
+    if len(snapshots) < 2:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    snapshot_rows = [
+        {"date": snapshot.date, "portfolio_value": _safe_number(snapshot.total_value)}
+        for snapshot in snapshots
+        if snapshot.date and snapshot.total_value is not None and _safe_number(snapshot.total_value) >= 0
+    ]
+    if len(snapshot_rows) < 2:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    start_date = snapshot_rows[0]["date"]
+    end_date = snapshot_rows[-1]["date"] + timedelta(days=1)
+
+    try:
+        benchmark_data = yf.download(
+            benchmark_symbol,
+            start=start_date,
+            end=end_date,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    if benchmark_data.empty or "Close" not in benchmark_data:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    benchmark_close = benchmark_data["Close"]
+    if isinstance(benchmark_close, pd.DataFrame):
+        if benchmark_close.empty or benchmark_close.shape[1] == 0:
+            return {
+                "benchmark": benchmark_symbol,
+                "points": [],
+                "start_date": None,
+                "end_date": None,
+                "observations": 0,
+            }
+        benchmark_close = benchmark_close.iloc[:, 0]
+
+    benchmark_close = pd.to_numeric(benchmark_close, errors="coerce").dropna()
+    if benchmark_close.empty:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    benchmark_close.index = pd.to_datetime(benchmark_close.index).date
+    benchmark_by_date = {
+        idx: float(value)
+        for idx, value in benchmark_close.items()
+        if math.isfinite(float(value)) and float(value) > 0
+    }
+
+    common_dates = sorted(
+        row["date"]
+        for row in snapshot_rows
+        if row["date"] in benchmark_by_date
+    )
+    if len(common_dates) < 2:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    portfolio_start = next(
+        row["portfolio_value"] for row in snapshot_rows if row["date"] == common_dates[0]
+    )
+    benchmark_start = benchmark_by_date[common_dates[0]]
+    if portfolio_start <= 0 or benchmark_start <= 0:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    portfolio_by_date = {
+        row["date"]: row["portfolio_value"]
+        for row in snapshot_rows
+    }
+    points = []
+    for point_date in common_dates:
+        portfolio_value = (portfolio_by_date[point_date] / portfolio_start) * 100
+        benchmark_value = (benchmark_by_date[point_date] / benchmark_start) * 100
+        points.append(
+            {
+                "date": point_date.isoformat(),
+                "portfolio_value": round(portfolio_value, 2),
+                "benchmark_value": round(benchmark_value, 2),
+                "portfolio_change_percent": round(portfolio_value - 100, 2),
+                "benchmark_change_percent": round(benchmark_value - 100, 2),
+            }
+        )
+
+    return {
+        "benchmark": benchmark_symbol,
+        "points": points,
+        "start_date": common_dates[0].isoformat(),
+        "end_date": common_dates[-1].isoformat(),
+        "observations": len(points),
+    }
+
+
 def get_imported_portfolio_dashboard(db: Session, category: str = "ALL"):
+    _ensure_imported_snapshot_history(db)
+    process_due_sips(db)
     normalized_category = category.strip().upper() if category else "ALL"
     holdings = db.query(ImportedHolding).order_by(ImportedHolding.symbol.asc()).all()
 
@@ -1032,6 +1867,8 @@ def get_imported_portfolio_dashboard(db: Session, category: str = "ALL"):
     latest_import = db.query(ImportedHolding).order_by(ImportedHolding.imported_at.desc()).first()
     benchmark = _fetch_benchmark_summary("^NSEI")
     benchmark_pe = benchmark.get("pe_ratio")
+    risk_metrics = _calculate_imported_risk_metrics(db, "^NSEI")
+    recurring_sips = db.query(RecurringSip).order_by(RecurringSip.next_run_date.asc(), RecurringSip.id.asc()).all()
 
     return {
         "overview": {
@@ -1049,6 +1886,24 @@ def get_imported_portfolio_dashboard(db: Session, category: str = "ALL"):
         "asset_allocation": _bucketize(rows, "asset_type"),
         "sector_allocation": _bucketize(rows, "sector"),
         "benchmark": benchmark,
+        "benchmark_charts": [
+            _fetch_benchmark_mini_chart("^NSEI", "Nifty 50"),
+            _fetch_benchmark_mini_chart("^BSESN", "Sensex"),
+        ],
+        "risk_metrics": risk_metrics,
+        "performance_comparison": _build_normalized_performance_comparison(db, "^NSEI", snapshot_model=ImportedPortfolioSnapshot),
+        "recurring_sips": [
+            {
+                "id": sip.id,
+                "symbol": sip.symbol,
+                "amount": round(_safe_number(sip.amount), 2),
+                "start_date": sip.start_date.isoformat(),
+                "next_run_date": sip.next_run_date.isoformat(),
+                "day_of_month": int(sip.day_of_month),
+                "active": bool(sip.active),
+            }
+            for sip in recurring_sips
+        ],
         "portfolio_avg_pe": portfolio_avg_pe,
         "benchmark_pe_gap": round(portfolio_avg_pe - benchmark_pe, 2)
         if portfolio_avg_pe is not None and benchmark_pe is not None

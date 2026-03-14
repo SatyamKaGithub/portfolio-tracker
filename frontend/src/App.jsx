@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
 import {
+  applyImportedHoldingTransaction,
+  addRecurringSip,
   getImportedDashboard,
   importHoldingsWorkbook,
   refreshImportedHoldings
@@ -7,14 +9,14 @@ import {
 import "./App.css"
 
 const PIE_COLORS = [
-  "#f7bf58",
-  "#68cf9c",
-  "#6da7ff",
-  "#ff8175",
-  "#c89dff",
-  "#8bd8ff",
-  "#ffd88a",
-  "#ffbca7"
+  "#4E79A7",
+  "#59A14F",
+  "#E15759",
+  "#76B7B2",
+  "#B07AA1",
+  "#F28E2B",
+  "#9C755F",
+  "#EDC948"
 ]
 
 function formatCurrency(value) {
@@ -63,6 +65,28 @@ function formatDateTime(value) {
   }).format(date)
 }
 
+function todayInputValue() {
+  const now = new Date()
+  const localTime = new Date(now.getTime() - now.getTimezoneOffset() * 60000)
+  return localTime.toISOString().slice(0, 10)
+}
+
+function formatDateLabel(value) {
+  if (!value) {
+    return ""
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
+    month: "short"
+  }).format(date)
+}
+
 function statusTone(value) {
   return Number(value) >= 0 ? "positive" : "negative"
 }
@@ -75,12 +99,15 @@ function polarToCartesian(centerX, centerY, radius, angleDeg) {
   }
 }
 
-function describeArc(centerX, centerY, radius, startAngle, endAngle) {
+function describeSector(centerX, centerY, radius, startAngle, endAngle) {
   const start = polarToCartesian(centerX, centerY, radius, endAngle)
   const end = polarToCartesian(centerX, centerY, radius, startAngle)
   const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1"
   return [
     "M",
+    centerX,
+    centerY,
+    "L",
     start.x,
     start.y,
     "A",
@@ -90,7 +117,8 @@ function describeArc(centerX, centerY, radius, startAngle, endAngle) {
     largeArcFlag,
     0,
     end.x,
-    end.y
+    end.y,
+    "Z"
   ].join(" ")
 }
 
@@ -143,7 +171,7 @@ function AllocationPie({
     accumulator.push({
       ...item,
       color: PIE_COLORS[index % PIE_COLORS.length],
-      path: describeArc(120, 120, 74, previousAngle, endAngle),
+      path: describeSector(120, 120, 88, previousAngle, endAngle),
       startAngle: previousAngle,
       endAngle,
       isActive
@@ -171,16 +199,13 @@ function AllocationPie({
       <div className="pie-layout">
         <div className="pie-wrap">
           <svg viewBox="0 0 240 240" className="pie-svg" role="img" aria-label={title}>
-            <circle cx="120" cy="120" r="74" fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="34" />
+            <circle cx="120" cy="120" r="88" fill="rgba(255,255,255,0.04)" />
             {slices.map((slice) => (
               <path
                 key={slice.name}
                 d={slice.path}
-                fill="none"
-                stroke={slice.color}
-                strokeWidth={slice.isActive ? 40 : 34}
-                strokeLinecap="round"
-                className="pie-slice"
+                fill={slice.color}
+                className={`pie-slice ${slice.isActive ? "active" : ""}`}
                 onMouseEnter={() => setHovered(slice)}
                 onMouseLeave={() => setHovered(null)}
                 onClick={() => onSliceSelect({ type: filterType, value: slice.name })}
@@ -220,15 +245,387 @@ function AllocationPie({
   )
 }
 
+function buildLinePath(points, width, height, padding, key, minValue, maxValue) {
+  const innerWidth = width - padding.left - padding.right
+  const innerHeight = height - padding.top - padding.bottom
+  const range = Math.max(maxValue - minValue, 1)
+
+  return points
+    .map((point, index) => {
+      const x =
+        padding.left +
+        (points.length === 1 ? innerWidth / 2 : (index / (points.length - 1)) * innerWidth)
+      const y = padding.top + ((maxValue - point[key]) / range) * innerHeight
+      return `${index === 0 ? "M" : "L"} ${x} ${y}`
+    })
+    .join(" ")
+}
+
+function PerformanceChart({ comparison, benchmarkName, overview, benchmark }) {
+  let points = comparison?.points ?? []
+  let startDate = comparison?.start_date
+  let endDate = comparison?.end_date
+
+  if (points.length < 2) {
+    const portfolioCurrent = Number(overview?.total_net_worth ?? 0)
+    const portfolioOneDayChange = Number(overview?.one_day_change ?? 0)
+    const portfolioPrevious = portfolioCurrent - portfolioOneDayChange
+    const benchmarkPrice = Number(benchmark?.price ?? 0)
+    const benchmarkPrevClose = Number(benchmark?.prev_close ?? 0)
+
+    if (portfolioCurrent > 0 && portfolioPrevious > 0 && benchmarkPrice > 0 && benchmarkPrevClose > 0) {
+      const today = todayInputValue()
+      const yesterday = new Date()
+      yesterday.setDate(yesterday.getDate() - 1)
+      const previousDate = yesterday.toISOString().slice(0, 10)
+      points = [
+        {
+          date: previousDate,
+          portfolio_value: 100,
+          benchmark_value: 100,
+          portfolio_change_percent: 0,
+          benchmark_change_percent: 0
+        },
+        {
+          date: today,
+          portfolio_value: (portfolioCurrent / portfolioPrevious) * 100,
+          benchmark_value: (benchmarkPrice / benchmarkPrevClose) * 100,
+          portfolio_change_percent: ((portfolioCurrent / portfolioPrevious) * 100) - 100,
+          benchmark_change_percent: ((benchmarkPrice / benchmarkPrevClose) * 100) - 100
+        }
+      ]
+      startDate = previousDate
+      endDate = today
+    }
+  }
+
+  if (points.length < 2) {
+    return (
+      <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="panel-kicker">Performance</p>
+            <h3>Portfolio vs benchmark</h3>
+          </div>
+        </div>
+        <p className="empty-state">Refresh holdings on multiple days to build the normalized performance chart.</p>
+      </section>
+    )
+  }
+
+  const width = 760
+  const height = 320
+  const padding = { top: 20, right: 22, bottom: 42, left: 92 }
+  const values = points.flatMap((point) => [point.portfolio_value, point.benchmark_value])
+  const minValue = Math.min(...values)
+  const maxValue = Math.max(...values)
+  const startPoint = points[0]
+  const endPoint = points[points.length - 1]
+  const portfolioPath = buildLinePath(points, width, height, padding, "portfolio_value", minValue, maxValue)
+  const benchmarkPath = buildLinePath(points, width, height, padding, "benchmark_value", minValue, maxValue)
+  const innerHeight = height - padding.top - padding.bottom
+  const yTicks = [0, 1, 2, 3].map((step) => {
+    const value = maxValue - ((maxValue - minValue) / 3) * step
+    const y = padding.top + (innerHeight / 3) * step
+    return { value, y }
+  })
+
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <div>
+          <p className="panel-kicker">Performance</p>
+          <h3>Portfolio vs benchmark</h3>
+        </div>
+        <span>
+          {startDate} to {endDate}
+        </span>
+      </div>
+
+      <div className="performance-split">
+        <div className="chart-summary">
+          <div className="chart-summary-item">
+            <span>Portfolio</span>
+            <strong className={statusTone(endPoint.portfolio_change_percent)}>
+              {formatPercent(endPoint.portfolio_change_percent)}
+            </strong>
+          </div>
+          <div className="chart-summary-item">
+            <span>{benchmarkName}</span>
+            <strong className={statusTone(endPoint.benchmark_change_percent)}>
+              {formatPercent(endPoint.benchmark_change_percent)}
+            </strong>
+          </div>
+          <div className="chart-summary-item">
+            <span>Spread</span>
+            <strong
+              className={statusTone(
+                endPoint.portfolio_change_percent - endPoint.benchmark_change_percent
+              )}
+            >
+              {formatPercent(
+                endPoint.portfolio_change_percent - endPoint.benchmark_change_percent
+              )}
+            </strong>
+          </div>
+          <div className="chart-summary-item">
+            <span>Normalized base</span>
+            <strong>{formatNumber(startPoint.portfolio_value, 0)}</strong>
+          </div>
+        </div>
+
+        <div>
+          <div className="performance-chart-wrap">
+            <svg viewBox={`0 0 ${width} ${height}`} className="performance-chart" role="img" aria-label="Portfolio vs benchmark performance">
+              <line x1={padding.left} y1={padding.top} x2={padding.left} y2={height - padding.bottom} className="chart-axis-line" />
+              <line x1={padding.left} y1={height - padding.bottom} x2={width - padding.right} y2={height - padding.bottom} className="chart-axis-line" />
+              {yTicks.map((tick, index) => {
+                return (
+                  <g key={index}>
+                    <line x1={padding.left} y1={tick.y} x2={width - padding.right} y2={tick.y} className="chart-grid-line" />
+                    <text x={padding.left - 12} y={tick.y + 4} textAnchor="end" className="chart-axis-text">
+                      {formatNumber(tick.value, 0)}
+                    </text>
+                  </g>
+                )
+              })}
+              <text x={28} y={height / 2} transform={`rotate(-90 28 ${height / 2})`} className="chart-axis-label">
+                Normalized value (Base = 100)
+              </text>
+              <text x={width / 2} y={height - 8} textAnchor="middle" className="chart-axis-label">
+                Time
+              </text>
+              <text x={padding.left} y={height - 18} textAnchor="start" className="chart-axis-text">
+                {formatDateLabel(startDate)}
+              </text>
+              <text x={width - padding.right} y={height - 18} textAnchor="end" className="chart-axis-text">
+                {formatDateLabel(endDate)}
+              </text>
+              <path d={benchmarkPath} className="chart-line benchmark-line" />
+              <path d={portfolioPath} className="chart-line portfolio-line" />
+            </svg>
+          </div>
+
+          <div className="chart-legend">
+            <span className="chart-legend-item">
+              <span className="chart-swatch portfolio-line-swatch" />
+              Portfolio
+            </span>
+            <span className="chart-legend-item">
+              <span className="chart-swatch benchmark-line-swatch" />
+              {benchmarkName}
+            </span>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function MiniTrendChart({ chart }) {
+  const points = chart?.points ?? []
+
+  if (points.length < 2) {
+    return null
+  }
+
+  const width = 150
+  const height = 44
+  const padding = { top: 6, right: 4, bottom: 6, left: 4 }
+  const values = points.map((point) => point.value)
+  const minValue = Math.min(...values)
+  const maxValue = Math.max(...values)
+  const rangeMin = Math.min(minValue, Number(chart.prev_close ?? minValue))
+  const rangeMax = Math.max(maxValue, Number(chart.prev_close ?? maxValue))
+  const path = buildLinePath(points, width, height, padding, "value", rangeMin, rangeMax)
+  const innerHeight = height - padding.top - padding.bottom
+  const baselineY =
+    chart.prev_close !== null && chart.prev_close !== undefined
+      ? padding.top + ((rangeMax - chart.prev_close) / Math.max(rangeMax - rangeMin, 1)) * innerHeight
+      : null
+
+  return (
+    <article className={`mini-chart-card ${chart.trend || ""}`}>
+      <div className="mini-chart-head">
+        <div>
+          <span>{chart.name}</span>
+          <strong>{chart.current_level !== null && chart.current_level !== undefined ? formatNumber(chart.current_level, 2) : "N/A"}</strong>
+        </div>
+        <div className="mini-chart-meta">
+          <small>{chart.symbol}</small>
+          <strong className={statusTone(chart.points_change ?? 0)}>
+            {chart.points_change !== null && chart.points_change !== undefined
+              ? `${chart.points_change >= 0 ? "+" : ""}${formatNumber(chart.points_change, 2)}`
+              : "N/A"}
+          </strong>
+          <span className={statusTone(chart.change_percent ?? 0)}>
+            {chart.change_percent !== null && chart.change_percent !== undefined
+              ? formatPercent(chart.change_percent)
+              : "N/A"}
+          </span>
+        </div>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="mini-chart" role="img" aria-label={`${chart.name} trend`}>
+        {baselineY !== null ? (
+          <line x1={padding.left} y1={baselineY} x2={width - padding.right} y2={baselineY} className="mini-chart-baseline" />
+        ) : null}
+        <path d={path} className={`mini-chart-line ${chart.trend || ""}`} />
+      </svg>
+    </article>
+  )
+}
+
+function TransactionModal({
+  holding,
+  form,
+  onChange,
+  onClose,
+  onSubmit,
+  submitting
+}) {
+  if (!holding) {
+    return null
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Update ${holding.symbol}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="panel-heading modal-heading">
+          <div>
+            <p className="panel-kicker">Manual update</p>
+            <h3>{holding.company_name || holding.symbol}</h3>
+          </div>
+          <button className="ghost-button" type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        <form className="transaction-form" onSubmit={onSubmit}>
+          <label>
+            <span>Transaction type</span>
+            <select name="type" value={form.type} onChange={onChange}>
+              <option value="BUY">Buy</option>
+              <option value="SELL">Sell</option>
+            </select>
+          </label>
+          <label>
+            <span>Quantity</span>
+            <input name="quantity" type="number" min="0.0001" step="0.0001" value={form.quantity} onChange={onChange} required />
+          </label>
+          <label>
+            <span>{form.type === "BUY" ? "Buy avg" : "Sell avg"}</span>
+            <input name="price" type="number" min="0.01" step="0.01" value={form.price} onChange={onChange} required />
+          </label>
+          <label>
+            <span>Transaction date</span>
+            <input name="date" type="date" value={form.date} onChange={onChange} required />
+          </label>
+
+          <div className="modal-note">
+            Current quantity: <strong>{formatNumber(holding.quantity, 4)}</strong> · Avg buy:{" "}
+            <strong>{formatCurrency(holding.avg_buy_cost)}</strong>
+          </div>
+
+          <div className="modal-actions">
+            <button className="ghost-button" type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="secondary-button" type="submit" disabled={submitting}>
+              {submitting ? "Saving..." : `${form.type === "BUY" ? "Buy" : "Sell"} stock`}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+function SipModal({
+  holding,
+  form,
+  onChange,
+  onClose,
+  onSubmit,
+  submitting
+}) {
+  if (!holding) {
+    return null
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Create SIP for ${holding.symbol}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="panel-heading modal-heading">
+          <div>
+            <p className="panel-kicker">Recurring SIP</p>
+            <h3>{holding.company_name || holding.symbol}</h3>
+          </div>
+          <button className="ghost-button" type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        <form className="transaction-form" onSubmit={onSubmit}>
+          <label>
+            <span>Monthly amount</span>
+            <input name="amount" type="number" min="1" step="1" value={form.amount} onChange={onChange} required />
+          </label>
+          <label>
+            <span>First SIP date</span>
+            <input name="start_date" type="date" value={form.start_date} onChange={onChange} required />
+          </label>
+          <div className="modal-note">
+            The SIP will execute every month on the same calendar day using the latest available mutual fund price.
+          </div>
+          <div className="modal-actions">
+            <button className="ghost-button" type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="secondary-button" type="submit" disabled={submitting}>
+              {submitting ? "Saving..." : "Create SIP"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [category, setCategory] = useState("ALL")
   const [dashboard, setDashboard] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [uploading, setUploading] = useState(false)
+  const [submittingTransaction, setSubmittingTransaction] = useState(false)
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
   const [allocationFilter, setAllocationFilter] = useState(null)
+  const [activeActionSymbol, setActiveActionSymbol] = useState(null)
+  const [transactionHolding, setTransactionHolding] = useState(null)
+  const [sipHolding, setSipHolding] = useState(null)
+  const [transactionForm, setTransactionForm] = useState({
+    type: "BUY",
+    quantity: "",
+    price: "",
+    date: todayInputValue()
+  })
+  const [sipForm, setSipForm] = useState({
+    amount: "",
+    start_date: todayInputValue()
+  })
 
   const loadDashboard = useCallback(async (selectedCategory = category, showLoader = true) => {
     if (showLoader) {
@@ -306,9 +703,123 @@ function App() {
     }
   }
 
+  function openTransactionModal(holding, type) {
+    setActiveActionSymbol(null)
+    setTransactionHolding(holding)
+    setTransactionForm({
+      type,
+      quantity: "",
+      price: holding.avg_buy_cost ? String(holding.avg_buy_cost) : "",
+      date: todayInputValue()
+    })
+  }
+
+  function closeTransactionModal() {
+    setTransactionHolding(null)
+    setTransactionForm({
+      type: "BUY",
+      quantity: "",
+      price: "",
+      date: todayInputValue()
+    })
+  }
+
+  function openSipModal(holding) {
+    setActiveActionSymbol(null)
+    setSipHolding(holding)
+    setSipForm({
+      amount: "",
+      start_date: todayInputValue()
+    })
+  }
+
+  function closeSipModal() {
+    setSipHolding(null)
+    setSipForm({
+      amount: "",
+      start_date: todayInputValue()
+    })
+  }
+
+  function handleTransactionChange(event) {
+    const { name, value } = event.target
+    setTransactionForm((current) => ({
+      ...current,
+      [name]: value
+    }))
+  }
+
+  function handleSipChange(event) {
+    const { name, value } = event.target
+    setSipForm((current) => ({
+      ...current,
+      [name]: value
+    }))
+  }
+
+  async function handleTransactionSubmit(event) {
+    event.preventDefault()
+    if (!transactionHolding) {
+      return
+    }
+
+    setSubmittingTransaction(true)
+    setError("")
+    setNotice("")
+
+    try {
+      const result = await applyImportedHoldingTransaction({
+        symbol: transactionHolding.symbol,
+        type: transactionForm.type,
+        quantity: Number(transactionForm.quantity),
+        price: Number(transactionForm.price),
+        date: transactionForm.date
+      })
+      setNotice(result.message || "Holding updated successfully.")
+      closeTransactionModal()
+      await loadDashboard(category, false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Transaction update failed")
+    } finally {
+      setSubmittingTransaction(false)
+    }
+  }
+
+  async function handleSipSubmit(event) {
+    event.preventDefault()
+    if (!sipHolding) {
+      return
+    }
+
+    setSubmittingTransaction(true)
+    setError("")
+    setNotice("")
+
+    try {
+      const result = await addRecurringSip({
+        symbol: sipHolding.symbol,
+        amount: Number(sipForm.amount),
+        start_date: sipForm.start_date
+      })
+      setNotice(
+        `SIP created for ${result.symbol}: ${formatCurrency(result.amount)} every month from ${result.start_date}.`
+      )
+      closeSipModal()
+      await loadDashboard(category, false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "SIP creation failed")
+    } finally {
+      setSubmittingTransaction(false)
+    }
+  }
+
   const overview = dashboard?.overview
   const holdings = useMemo(() => dashboard?.holdings ?? [], [dashboard])
   const benchmark = dashboard?.benchmark
+  const benchmarkCharts = dashboard?.benchmark_charts ?? []
+  const riskMetrics = dashboard?.risk_metrics
+  const performanceComparison = dashboard?.performance_comparison
+  const recurringSips = dashboard?.recurring_sips ?? []
   const assetAllocation = dashboard?.asset_allocation ?? []
   const sectorAllocation = dashboard?.sector_allocation ?? []
   const categories = overview?.available_categories ?? ["ALL"]
@@ -370,7 +881,7 @@ function App() {
 
       {loading ? (
         <div className="loading-panel">Loading imported portfolio...</div>
-      ) : !dashboard || !holdings.length ? (
+      ) : !dashboard ? (
         <section className="panel empty-panel">
           <p className="panel-kicker">Ready for import</p>
           <h3>Upload a broker holdings `.xlsx` file to build the portfolio snapshot.</h3>
@@ -403,6 +914,7 @@ function App() {
             </div>
             <p className="toolbar-note">
               Viewing: <strong>{overview.selected_category}</strong> · {overview.holdings_count} holdings
+              {recurringSips.length ? ` · ${recurringSips.length} SIP${recurringSips.length > 1 ? "s" : ""} active` : ""}
             </p>
           </section>
 
@@ -438,31 +950,67 @@ function App() {
               <span>{benchmark?.symbol || "^NSEI"}</span>
             </div>
 
-            <div className="metric-grid">
-              <div className="metric-card">
-                <span>Index level</span>
-                <strong>{benchmark?.price ? formatNumber(benchmark.price, 2) : "N/A"}</strong>
+            <div className="benchmark-layout">
+              <div className="benchmark-metrics">
+                <div className="benchmark-grid">
+                  <div className="metric-card benchmark-card">
+                    <span>1D move</span>
+                    <strong className={statusTone(benchmark?.one_day_change_percent ?? 0)}>
+                      {benchmark?.one_day_change_percent !== null ? formatPercent(benchmark.one_day_change_percent) : "N/A"}
+                    </strong>
+                  </div>
+                  <div className="metric-card benchmark-card">
+                    <span>Index P/E</span>
+                    <strong>{benchmark?.pe_ratio !== null ? formatNumber(benchmark.pe_ratio, 2) : "N/A"}</strong>
+                  </div>
+                  <div className="metric-card benchmark-card">
+                    <span>Portfolio vs index 1D</span>
+                    <strong className={statusTone((overview.one_day_change_percent ?? 0) - (benchmark?.one_day_change_percent ?? 0))}>
+                      {benchmark?.one_day_change_percent !== null
+                        ? formatPercent(overview.one_day_change_percent - benchmark.one_day_change_percent)
+                        : "N/A"}
+                    </strong>
+                  </div>
+                  <div className="metric-card benchmark-card">
+                    <span>Sharpe ratio</span>
+                    <strong>
+                      {riskMetrics?.sharpe_ratio !== null && riskMetrics?.sharpe_ratio !== undefined
+                        ? formatNumber(riskMetrics.sharpe_ratio, 2)
+                        : "N/A"}
+                    </strong>
+                  </div>
+                  <div className="metric-card benchmark-card">
+                    <span>Beta</span>
+                    <strong>
+                      {riskMetrics?.beta !== null && riskMetrics?.beta !== undefined
+                        ? formatNumber(riskMetrics.beta, 2)
+                        : "N/A"}
+                    </strong>
+                  </div>
+                  <div className="metric-card benchmark-card">
+                    <span>Alpha</span>
+                    <strong className={statusTone(riskMetrics?.alpha_annualized_percent ?? 0)}>
+                      {riskMetrics?.alpha_annualized_percent !== null && riskMetrics?.alpha_annualized_percent !== undefined
+                        ? formatPercent(riskMetrics.alpha_annualized_percent)
+                        : "N/A"}
+                    </strong>
+                  </div>
+                </div>
               </div>
-              <div className="metric-card">
-                <span>1D move</span>
-                <strong className={statusTone(benchmark?.one_day_change_percent ?? 0)}>
-                  {benchmark?.one_day_change_percent !== null ? formatPercent(benchmark.one_day_change_percent) : "N/A"}
-                </strong>
-              </div>
-              <div className="metric-card">
-                <span>Index P/E</span>
-                <strong>{benchmark?.pe_ratio !== null ? formatNumber(benchmark.pe_ratio, 2) : "N/A"}</strong>
-              </div>
-              <div className="metric-card">
-                <span>Portfolio vs index 1D</span>
-                <strong className={statusTone((overview.one_day_change_percent ?? 0) - (benchmark?.one_day_change_percent ?? 0))}>
-                  {benchmark?.one_day_change_percent !== null
-                    ? formatPercent(overview.one_day_change_percent - benchmark.one_day_change_percent)
-                    : "N/A"}
-                </strong>
+              <div className="benchmark-empty">
+                {benchmarkCharts.map((chart) => (
+                  <MiniTrendChart key={chart.symbol} chart={chart} />
+                ))}
               </div>
             </div>
           </section>
+
+          <PerformanceChart
+            comparison={performanceComparison}
+            benchmarkName={benchmark?.name || benchmark?.symbol || "Benchmark"}
+            overview={overview}
+            benchmark={benchmark}
+          />
 
           <section className="panel-grid">
             <AllocationPie
@@ -515,6 +1063,7 @@ function App() {
                     <th>1D change</th>
                     <th>Unrealised P&amp;L</th>
                     <th>P/E</th>
+                    <th />
                   </tr>
                 </thead>
                 <tbody>
@@ -536,11 +1085,42 @@ function App() {
                         <td className={statusTone(holding.one_day_change)}>{formatCurrency(holding.one_day_change)}</td>
                         <td className={statusTone(holding.unrealized_pnl)}>{formatCurrency(holding.unrealized_pnl)}</td>
                         <td>{holding.pe_ratio !== null ? formatNumber(holding.pe_ratio, 2) : "N/A"}</td>
+                        <td className="row-action-cell">
+                          <div className="row-action-wrap">
+                            <button
+                              className="row-action-button"
+                              type="button"
+                              aria-label={`Actions for ${holding.symbol}`}
+                              onClick={() =>
+                                setActiveActionSymbol((current) =>
+                                  current === holding.symbol ? null : holding.symbol
+                                )
+                              }
+                            >
+                              ...
+                            </button>
+                            {activeActionSymbol === holding.symbol ? (
+                              <div className="row-action-menu">
+                                <button type="button" onClick={() => openTransactionModal(holding, "BUY")}>
+                                  Buy more
+                                </button>
+                                <button type="button" onClick={() => openTransactionModal(holding, "SELL")}>
+                                  Sell
+                                </button>
+                                {holding.asset_type === "Mutual Fund" ? (
+                                  <button type="button" onClick={() => openSipModal(holding)}>
+                                    Create SIP
+                                  </button>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        </td>
                       </tr>
                     ))
                   ) : (
                     <tr>
-                      <td colSpan="10" className="empty-state">
+                      <td colSpan="11" className="empty-state">
                         No holdings match the selected filter.
                       </td>
                     </tr>
@@ -551,6 +1131,23 @@ function App() {
           </section>
         </>
       )}
+
+      <TransactionModal
+        holding={transactionHolding}
+        form={transactionForm}
+        onChange={handleTransactionChange}
+        onClose={closeTransactionModal}
+        onSubmit={handleTransactionSubmit}
+        submitting={submittingTransaction}
+      />
+      <SipModal
+        holding={sipHolding}
+        form={sipForm}
+        onChange={handleSipChange}
+        onClose={closeSipModal}
+        onSubmit={handleSipSubmit}
+        submitting={submittingTransaction}
+      />
     </div>
   )
 }

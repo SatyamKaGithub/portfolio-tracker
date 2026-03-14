@@ -4,8 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Union
 from app.db import engine, SessionLocal, Base
 from app.models import Holding, PortfolioSnapshot
-from app.schemas import HoldingCreate, HoldingsImportPayload
+from app.schemas import (
+    HoldingCreate,
+    HoldingsImportPayload,
+    ImportedHoldingTransactionCreate,
+    RecurringSipCreate,
+)
 from app.services import (
+    apply_imported_holding_transaction,
     calculate_alpha,
     calculate_beta,
     calculate_daily_returns,
@@ -17,6 +23,7 @@ from app.services import (
     calculate_sharpe_ratio,
     calculate_tracking_error,
     calculate_volatility,
+    create_recurring_sip,
     get_imported_portfolio_dashboard,
     import_holdings_workbook,
     refresh_imported_holdings_market_data,
@@ -171,6 +178,28 @@ def import_holdings(payload: HoldingsImportPayload, db: Session = Depends(get_db
 @app.post("/imports/holdings/refresh")
 def refresh_imported_holdings(db: Session = Depends(get_db)):
     return refresh_imported_holdings_market_data(db)
+
+
+@app.post("/imports/holdings/transactions")
+def apply_imported_transaction(
+    txn: ImportedHoldingTransactionCreate,
+    db: Session = Depends(get_db),
+):
+    try:
+        return apply_imported_holding_transaction(db, txn)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/imports/holdings/sips")
+def add_recurring_sip(
+    payload: RecurringSipCreate,
+    db: Session = Depends(get_db),
+):
+    try:
+        return create_recurring_sip(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/portfolio/imported-dashboard")
