@@ -1,6 +1,6 @@
-from sqlalchemy import Column, Integer, String, Float, Date, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, UniqueConstraint
 from app.db import Base
-from datetime import date
+from datetime import date, datetime
 
 class Holding(Base):
     __tablename__ = "holdings"
@@ -42,3 +42,28 @@ class Transaction(Base):
     price = Column(Float)
     type = Column(String)  # BUY or SELL
     date = Column(Date, default=date.today)
+
+
+class ImportedHolding(Base):
+    __tablename__ = "imported_holdings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, index=True)
+    company_name = Column(String, nullable=True)
+    isin = Column(String, nullable=True)
+    asset_type = Column(String, default="STOCK", index=True)
+    sector = Column(String, nullable=True)
+    geography = Column(String, nullable=True)
+    exchange_symbol = Column(String, nullable=True)
+    quantity = Column(Float, default=0)
+    avg_buy_cost = Column(Float, default=0)
+    invested_amount = Column(Float, default=0)
+    prev_close = Column(Float, nullable=True)
+    current_price = Column(Float, nullable=True)
+    current_value = Column(Float, nullable=True)
+    one_day_change = Column(Float, nullable=True)
+    unrealized_pnl = Column(Float, nullable=True)
+    pe_ratio = Column(Float, nullable=True)
+    currency = Column(String, default="INR")
+    source_file = Column(String, nullable=True)
+    imported_at = Column(DateTime, default=datetime.utcnow, index=True)

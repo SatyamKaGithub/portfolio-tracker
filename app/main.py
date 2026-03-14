@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Union
 from app.db import engine, SessionLocal, Base
 from app.models import Holding, PortfolioSnapshot
-from app.schemas import HoldingCreate
+from app.schemas import HoldingCreate, HoldingsImportPayload
 from app.services import (
     calculate_alpha,
     calculate_beta,
@@ -17,6 +17,9 @@ from app.services import (
     calculate_sharpe_ratio,
     calculate_tracking_error,
     calculate_volatility,
+    get_imported_portfolio_dashboard,
+    import_holdings_workbook,
+    refresh_imported_holdings_market_data,
     update_prices,
 )
 from app.schemas import TransactionCreate
@@ -155,3 +158,24 @@ def add_transaction(
 @app.get("/transactions")
 def get_transactions(db: Session = Depends(get_db)):
     return db.query(Transaction).order_by(Transaction.date.asc(), Transaction.id.asc()).all()
+
+
+@app.post("/imports/holdings")
+def import_holdings(payload: HoldingsImportPayload, db: Session = Depends(get_db)):
+    try:
+        return import_holdings_workbook(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/imports/holdings/refresh")
+def refresh_imported_holdings(db: Session = Depends(get_db)):
+    return refresh_imported_holdings_market_data(db)
+
+
+@app.get("/portfolio/imported-dashboard")
+def imported_dashboard(
+    category: str = Query(default="ALL"),
+    db: Session = Depends(get_db),
+):
+    return get_imported_portfolio_dashboard(db, category=category)

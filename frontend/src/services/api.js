@@ -32,3 +32,87 @@ export async function createTransaction(data) {
     body: JSON.stringify(data)
   })
 }
+
+export async function getHoldings() {
+  return request("/holdings")
+}
+
+export async function getPortfolioValue() {
+  return request("/portfolio/value")
+}
+
+export async function getPortfolioHistory() {
+  return request("/portfolio/history")
+}
+
+export async function getPortfolioPerformance() {
+  return request("/portfolio/performance")
+}
+
+export async function getDailyReturns(limit = 30) {
+  return request(`/portfolio/daily-returns?limit=${limit}`)
+}
+
+export async function getMaxDrawdown() {
+  return request("/portfolio/drawdown")
+}
+
+export async function getVolatility() {
+  return request("/portfolio/volatility")
+}
+
+export async function getSharpeRatio() {
+  return request("/portfolio/sharpe")
+}
+
+export async function getRollingVolatility(window = 5) {
+  return request(`/portfolio/rolling-volatility?window=${window}`)
+}
+
+export async function getBeta(benchmark = "^NSEI") {
+  return request(`/portfolio/beta?benchmark=${encodeURIComponent(benchmark)}`)
+}
+
+export async function getAlpha(benchmark = "^NSEI") {
+  return request(`/portfolio/alpha?benchmark=${encodeURIComponent(benchmark)}`)
+}
+
+export async function getInformationRatio(benchmark = "^NSEI") {
+  return request(
+    `/portfolio/information-ratio?benchmark=${encodeURIComponent(benchmark)}`
+  )
+}
+
+export async function getTrackingError(benchmark = "^NSEI") {
+  return request(
+    `/portfolio/tracking-error?benchmark=${encodeURIComponent(benchmark)}`
+  )
+}
+
+export async function refreshPrices() {
+  return request("/prices/update", {
+    method: "POST"
+  })
+}
+
+export async function importHoldingsWorkbook(payload) {
+  return request("/imports/holdings", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function refreshImportedHoldings() {
+  return request("/imports/holdings/refresh", {
+    method: "POST"
+  })
+}
+
+export async function getImportedDashboard(category = "ALL") {
+  return request(
+    `/portfolio/imported-dashboard?category=${encodeURIComponent(category)}`
+  )
+}

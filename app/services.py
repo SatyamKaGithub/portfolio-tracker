@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import math
 from typing import Dict, List, Optional
 
@@ -8,8 +8,9 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Holding, PortfolioSnapshot, Price, Transaction
-from app.schemas import TransactionCreate
+from app.importers import decode_base64_document, parse_xlsx_holdings
+from app.models import Holding, ImportedHolding, PortfolioSnapshot, Price, Transaction
+from app.schemas import HoldingsImportPayload, TransactionCreate
 
 EPSILON = 1e-9
 
@@ -680,4 +681,378 @@ def portfolio_value_from_ledger(db: Session, as_of: Optional[date] = None):
         "total_value": total_value,
         "missing_price_symbols": sorted(set(missing_price_symbols)),
         "negative_symbols": negative_symbols,
+    }
+
+
+def _first_finite(*values: Optional[float]) -> Optional[float]:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def _normalize_asset_type(value: Optional[str]) -> str:
+    normalized = (value or "").strip().upper()
+    if normalized in {"MUTUAL FUND", "MUTUAL_FUND", "MF"}:
+        return "MUTUAL_FUND"
+    if normalized == "ETF":
+        return "ETF"
+    return "STOCK"
+
+
+def _display_asset_type(value: str) -> str:
+    if value == "MUTUAL_FUND":
+        return "Mutual Fund"
+    if value == "ETF":
+        return "ETF"
+    return "Stock"
+
+
+def _candidate_market_symbols(holding: ImportedHolding) -> List[str]:
+    if holding.exchange_symbol:
+        return [holding.exchange_symbol]
+
+    symbol = _normalize_symbol(holding.symbol or "")
+    if not symbol:
+        return []
+
+    candidates = [symbol]
+    if "." not in symbol:
+        candidates.extend([f"{symbol}.NS", f"{symbol}.BO"])
+    return candidates
+
+
+def _fetch_quote_snapshot(holding: ImportedHolding) -> Dict[str, Optional[float] | str]:
+    for candidate in _candidate_market_symbols(holding):
+        try:
+            ticker = yf.Ticker(candidate)
+            history = ticker.history(period="5d", auto_adjust=False)
+        except Exception:
+            continue
+
+        if history.empty or "Close" not in history:
+            continue
+
+        closes = history["Close"].dropna()
+        if closes.empty:
+            continue
+
+        current_price = float(closes.iloc[-1])
+        prev_close = float(closes.iloc[-2]) if len(closes) > 1 else current_price
+
+        company_name = None
+        sector = None
+        geography = None
+        quote_type = None
+        pe_ratio = None
+
+        try:
+            info = ticker.info or {}
+        except Exception:
+            info = {}
+
+        if info:
+            company_name = info.get("shortName") or info.get("longName")
+            sector = info.get("sector") or info.get("industry")
+            geography = info.get("country")
+            quote_type = info.get("quoteType")
+            pe_ratio = _first_finite(
+                info.get("trailingPE"),
+                info.get("forwardPE"),
+            )
+
+        return {
+            "exchange_symbol": candidate,
+            "current_price": current_price,
+            "prev_close": prev_close,
+            "company_name": company_name,
+            "sector": sector,
+            "geography": geography,
+            "quote_type": quote_type,
+            "pe_ratio": pe_ratio,
+        }
+
+    return {}
+
+
+def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
+    file_bytes = decode_base64_document(payload.content_base64)
+    workbook = parse_xlsx_holdings(file_bytes)
+
+    rows = workbook.rows
+    if not rows:
+        raise ValueError("No holding rows were found in the uploaded workbook")
+
+    db.query(ImportedHolding).delete()
+
+    created_rows = 0
+    imported_at = datetime.utcnow()
+
+    for row in rows:
+        quantity = _safe_number(row.get("quantity"))
+        avg_buy_cost = _safe_number(row.get("avg_buy_cost"))
+        invested_amount = _safe_number(row.get("invested_amount")) or quantity * avg_buy_cost
+        current_price = _first_finite(row.get("current_price"))
+        prev_close = _first_finite(row.get("prev_close"))
+        current_value = _first_finite(row.get("current_value"))
+
+        if current_value is None and current_price is not None:
+            current_value = quantity * current_price
+
+        unrealized_pnl = _first_finite(row.get("unrealized_pnl"))
+        if unrealized_pnl is None and current_value is not None:
+            unrealized_pnl = current_value - invested_amount
+
+        one_day_change = _first_finite(row.get("one_day_change"))
+        if one_day_change is None and current_price is not None and prev_close is not None:
+            one_day_change = (current_price - prev_close) * quantity
+
+        db.add(
+            ImportedHolding(
+                symbol=_normalize_symbol(str(row.get("symbol", ""))),
+                company_name=row.get("company_name"),
+                isin=row.get("isin"),
+                asset_type=_normalize_asset_type(str(row.get("asset_type"))),
+                sector=row.get("sector"),
+                quantity=quantity,
+                avg_buy_cost=avg_buy_cost,
+                invested_amount=invested_amount,
+                prev_close=prev_close,
+                current_price=current_price,
+                current_value=current_value,
+                one_day_change=one_day_change,
+                unrealized_pnl=unrealized_pnl,
+                currency=str(row.get("currency") or "INR"),
+                source_file=payload.filename,
+                imported_at=imported_at,
+            )
+        )
+        created_rows += 1
+
+    db.commit()
+    refresh_imported_holdings_market_data(db)
+
+    return {
+        "message": "Holdings imported successfully",
+        "sheet_name": workbook.sheet_name,
+        "rows_imported": created_rows,
+        "source_file": payload.filename,
+    }
+
+
+def refresh_imported_holdings_market_data(db: Session):
+    holdings = db.query(ImportedHolding).order_by(ImportedHolding.symbol.asc()).all()
+    updated = 0
+    failed_symbols: List[str] = []
+
+    for holding in holdings:
+        snapshot = _fetch_quote_snapshot(holding)
+        quantity = _safe_number(holding.quantity)
+
+        if not snapshot:
+            failed_symbols.append(holding.symbol)
+            continue
+
+        current_price = _first_finite(snapshot.get("current_price"), holding.current_price)
+        prev_close = _first_finite(snapshot.get("prev_close"), holding.prev_close)
+
+        holding.exchange_symbol = str(snapshot.get("exchange_symbol") or holding.exchange_symbol or "")
+        holding.company_name = str(snapshot.get("company_name") or holding.company_name or "")
+        holding.sector = str(snapshot.get("sector") or holding.sector or "")
+        holding.geography = str(snapshot.get("geography") or holding.geography or "India")
+        holding.current_price = current_price
+        holding.prev_close = prev_close
+        holding.current_value = quantity * current_price if current_price is not None else holding.current_value
+        if current_price is not None and prev_close is not None:
+            holding.one_day_change = quantity * (current_price - prev_close)
+        if holding.current_value is not None:
+            holding.unrealized_pnl = holding.current_value - _safe_number(holding.invested_amount)
+        holding.pe_ratio = _first_finite(snapshot.get("pe_ratio"), holding.pe_ratio)
+
+        quote_type = str(snapshot.get("quote_type") or "").strip().upper()
+        if quote_type == "ETF":
+            holding.asset_type = "ETF"
+        elif quote_type in {"MUTUALFUND", "MUTUAL FUND"}:
+            holding.asset_type = "MUTUAL_FUND"
+
+        updated += 1
+
+    db.commit()
+
+    return {
+        "message": "Imported holdings refreshed",
+        "updated_count": updated,
+        "failed_symbols": failed_symbols,
+    }
+
+
+def _serialize_imported_holding(holding: ImportedHolding) -> Dict[str, object]:
+    invested_amount = _safe_number(holding.invested_amount)
+    current_value = _safe_number(holding.current_value)
+    one_day_change = _safe_number(holding.one_day_change)
+    unrealized_pnl = _safe_number(holding.unrealized_pnl)
+    weight_percent = 0.0
+
+    return {
+        "symbol": holding.symbol,
+        "company_name": holding.company_name or holding.symbol,
+        "isin": holding.isin,
+        "asset_type": _display_asset_type(_normalize_asset_type(holding.asset_type)),
+        "sector": holding.sector or "Unclassified",
+        "geography": holding.geography or "India",
+        "exchange_symbol": holding.exchange_symbol,
+        "quantity": round(_safe_number(holding.quantity), 4),
+        "avg_buy_cost": round(_safe_number(holding.avg_buy_cost), 2),
+        "invested_amount": round(invested_amount, 2),
+        "prev_close": round(_safe_number(holding.prev_close), 2) if holding.prev_close is not None else None,
+        "current_price": round(_safe_number(holding.current_price), 2) if holding.current_price is not None else None,
+        "current_value": round(current_value, 2),
+        "one_day_change": round(one_day_change, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "pe_ratio": round(_safe_number(holding.pe_ratio), 2) if holding.pe_ratio is not None else None,
+        "currency": holding.currency or "INR",
+        "source_file": holding.source_file,
+        "weight_percent": weight_percent,
+    }
+
+
+def _bucketize(rows: List[Dict[str, object]], field: str) -> List[Dict[str, float | str]]:
+    totals: Dict[str, float] = {}
+    grand_total = sum(_safe_number(row.get("current_value")) for row in rows)
+
+    for row in rows:
+        name = str(row.get(field) or "Unclassified").strip() or "Unclassified"
+        totals[name] = totals.get(name, 0.0) + _safe_number(row.get("current_value"))
+
+    buckets = [
+        {
+            "name": name,
+            "value": round(value, 2),
+            "weight_percent": round((value / grand_total) * 100, 2) if grand_total else 0.0,
+        }
+        for name, value in sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return buckets
+
+
+def _fetch_benchmark_summary(symbol: str = "^NSEI") -> Dict[str, object]:
+    try:
+        ticker = yf.Ticker(symbol)
+        history = ticker.history(period="5d", auto_adjust=False)
+    except Exception:
+        return {
+            "symbol": symbol,
+            "name": "Nifty 50",
+            "price": None,
+            "prev_close": None,
+            "one_day_change_percent": None,
+            "pe_ratio": None,
+        }
+
+    closes = history["Close"].dropna() if not history.empty and "Close" in history else []
+    price = float(closes.iloc[-1]) if len(closes) else None
+    prev_close = float(closes.iloc[-2]) if len(closes) > 1 else price
+    change_percent = None
+    if price is not None and prev_close not in (None, 0):
+        change_percent = ((price - prev_close) / prev_close) * 100
+
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}
+
+    pe_ratio = _first_finite(info.get("trailingPE"), info.get("forwardPE")) if info else None
+
+    return {
+        "symbol": symbol,
+        "name": str(info.get("shortName") or "Nifty 50") if info else "Nifty 50",
+        "price": round(price, 2) if price is not None else None,
+        "prev_close": round(prev_close, 2) if prev_close is not None else None,
+        "one_day_change_percent": round(change_percent, 2) if change_percent is not None else None,
+        "pe_ratio": round(pe_ratio, 2) if pe_ratio is not None else None,
+    }
+
+
+def get_imported_portfolio_dashboard(db: Session, category: str = "ALL"):
+    normalized_category = category.strip().upper() if category else "ALL"
+    holdings = db.query(ImportedHolding).order_by(ImportedHolding.symbol.asc()).all()
+
+    available_categories = ["ALL"] + sorted(
+        {_display_asset_type(_normalize_asset_type(holding.asset_type)) for holding in holdings}
+    )
+
+    if normalized_category != "ALL":
+        holdings = [
+            holding
+            for holding in holdings
+            if _display_asset_type(_normalize_asset_type(holding.asset_type)).upper().replace(" ", "_")
+            == normalized_category.replace(" ", "_")
+        ]
+
+    rows = [_serialize_imported_holding(holding) for holding in holdings]
+    total_current_value = sum(_safe_number(row.get("current_value")) for row in rows)
+
+    for row in rows:
+        current_value = _safe_number(row.get("current_value"))
+        row["weight_percent"] = round((current_value / total_current_value) * 100, 2) if total_current_value else 0.0
+
+    total_invested = sum(_safe_number(row.get("invested_amount")) for row in rows)
+    total_gain = sum(_safe_number(row.get("unrealized_pnl")) for row in rows)
+    one_day_change = sum(_safe_number(row.get("one_day_change")) for row in rows)
+    previous_day_value = total_current_value - one_day_change
+    one_day_change_percent = (
+        (one_day_change / previous_day_value) * 100
+        if previous_day_value not in (0, None)
+        else 0.0
+    )
+    total_gain_percent = ((total_gain / total_invested) * 100) if total_invested else 0.0
+
+    weighted_pe_numerator = sum(
+        _safe_number(row.get("current_value")) * _safe_number(row.get("pe_ratio"))
+        for row in rows
+        if row.get("pe_ratio") is not None
+    )
+    weighted_pe_denominator = sum(
+        _safe_number(row.get("current_value"))
+        for row in rows
+        if row.get("pe_ratio") is not None
+    )
+    portfolio_avg_pe = (
+        round(weighted_pe_numerator / weighted_pe_denominator, 2)
+        if weighted_pe_denominator
+        else None
+    )
+
+    latest_import = db.query(ImportedHolding).order_by(ImportedHolding.imported_at.desc()).first()
+    benchmark = _fetch_benchmark_summary("^NSEI")
+    benchmark_pe = benchmark.get("pe_ratio")
+
+    return {
+        "overview": {
+            "total_net_worth": round(total_current_value, 2),
+            "total_gain": round(total_gain, 2),
+            "total_gain_percent": round(total_gain_percent, 2),
+            "one_day_change": round(one_day_change, 2),
+            "one_day_change_percent": round(one_day_change_percent, 2),
+            "holdings_count": len(rows),
+            "as_of": latest_import.imported_at.isoformat() if latest_import else None,
+            "selected_category": "All" if normalized_category == "ALL" else normalized_category.replace("_", " ").title(),
+            "available_categories": available_categories,
+        },
+        "holdings": rows,
+        "asset_allocation": _bucketize(rows, "asset_type"),
+        "sector_allocation": _bucketize(rows, "sector"),
+        "benchmark": benchmark,
+        "portfolio_avg_pe": portfolio_avg_pe,
+        "benchmark_pe_gap": round(portfolio_avg_pe - benchmark_pe, 2)
+        if portfolio_avg_pe is not None and benchmark_pe is not None
+        else None,
+        "import_file_name": latest_import.source_file if latest_import else None,
+        "imported_at": latest_import.imported_at.isoformat() if latest_import else None,
     }
