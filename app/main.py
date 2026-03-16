@@ -205,6 +205,11 @@ def add_recurring_sip(
 @app.get("/portfolio/imported-dashboard")
 def imported_dashboard(
     category: str = Query(default="ALL"),
+    performance_period: str = Query(default="1Y"),
     db: Session = Depends(get_db),
 ):
-    return get_imported_portfolio_dashboard(db, category=category)
+    return get_imported_portfolio_dashboard(
+        db,
+        category=category,
+        performance_period=performance_period,
+    )

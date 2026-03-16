@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   applyImportedHoldingTransaction,
   addRecurringSip,
@@ -17,6 +17,87 @@ const PIE_COLORS = [
   "#F28E2B",
   "#9C755F",
   "#EDC948"
+]
+
+const NIFTY_50_TICKER_ITEMS = [
+  { symbol: "RELIANCE", name: "Reliance", change: 1.18 },
+  { symbol: "HDFCBANK", name: "HDFC Bank", change: -0.42 },
+  { symbol: "ICICIBANK", name: "ICICI Bank", change: 0.84 },
+  { symbol: "INFY", name: "Infosys", change: -0.31 },
+  { symbol: "TCS", name: "TCS", change: 0.47 },
+  { symbol: "LT", name: "L&T", change: 1.06 },
+  { symbol: "ITC", name: "ITC", change: -0.18 },
+  { symbol: "SBIN", name: "SBI", change: 0.93 },
+  { symbol: "BHARTIARTL", name: "Airtel", change: 0.58 },
+  { symbol: "KOTAKBANK", name: "Kotak", change: -0.27 },
+  { symbol: "AXISBANK", name: "Axis Bank", change: 0.39 },
+  { symbol: "ASIANPAINT", name: "Asian Paints", change: -0.62 }
+]
+
+const MARKET_NEWS_ITEMS = [
+  {
+    id: "news-1",
+    headline: "Banking stocks lead gains as credit growth expectations improve",
+    highlight: "Private banks outperformed with strong volume signals in the last session.",
+    keyDetail: "Portfolio watch: financial allocation saw the strongest intraday contribution.",
+    source: "Market Pulse",
+    publishedAt: "2h ago",
+    url: "https://example.com/market-news/banking-gains"
+  },
+  {
+    id: "news-2",
+    headline: "IT names remain range-bound ahead of US macro data",
+    highlight: "Large-cap IT traded in a narrow band with mixed momentum readings.",
+    keyDetail: "Portfolio watch: near-term volatility expected in export-driven holdings.",
+    source: "Business Track",
+    publishedAt: "3h ago",
+    url: "https://example.com/market-news/it-range-bound"
+  },
+  {
+    id: "news-3",
+    headline: "Auto counters gain on steady monthly dispatch trends",
+    highlight: "Passenger and two-wheeler names saw broad-based buying.",
+    keyDetail: "Portfolio watch: cyclical sectors continue to support overall P&L.",
+    source: "Street Brief",
+    publishedAt: "4h ago",
+    url: "https://example.com/market-news/auto-dispatch"
+  },
+  {
+    id: "news-4",
+    headline: "Mid and small caps witness selective profit booking",
+    highlight: "High-beta names cooled off after a multi-session rally.",
+    keyDetail: "Portfolio watch: rebalance candidates may appear in overheated pockets.",
+    source: "Capital Wire",
+    publishedAt: "5h ago",
+    url: "https://example.com/market-news/midcap-booking"
+  },
+  {
+    id: "news-5",
+    headline: "Defensive FMCG stocks draw fresh institutional interest",
+    highlight: "Investors rotated toward lower-volatility consumption names.",
+    keyDetail: "Portfolio watch: defensives helped offset intraday risk-off moves.",
+    source: "Daily Markets",
+    publishedAt: "6h ago",
+    url: "https://example.com/market-news/fmcg-defensive"
+  },
+  {
+    id: "news-6",
+    headline: "Energy complex stable despite crude price swings",
+    highlight: "Integrated players held key support levels through the session.",
+    keyDetail: "Portfolio watch: margin outlook remains sensitive to input-price changes.",
+    source: "FinScope",
+    publishedAt: "7h ago",
+    url: "https://example.com/market-news/energy-stable"
+  },
+  {
+    id: "news-7",
+    headline: "Mutual fund SIP trends remain resilient month-on-month",
+    highlight: "Steady retail inflows continue to support long-duration allocations.",
+    keyDetail: "Portfolio watch: long-term compounding themes remain intact.",
+    source: "Investor Desk",
+    publishedAt: "8h ago",
+    url: "https://example.com/market-news/sip-trends"
+  }
 ]
 
 function formatCurrency(value) {
@@ -47,6 +128,15 @@ function formatPercent(value, digits = 2) {
   }
 
   return `${amount >= 0 ? "+" : ""}${formatNumber(amount, digits)}%`
+}
+
+function formatSignedNumber(value, digits = 2) {
+  const amount = Number(value)
+  if (!Number.isFinite(amount)) {
+    return "N/A"
+  }
+
+  return `${amount >= 0 ? "+" : ""}${formatNumber(amount, digits)}`
 }
 
 function formatDateTime(value) {
@@ -85,6 +175,23 @@ function formatDateLabel(value) {
     day: "2-digit",
     month: "short"
   }).format(date)
+}
+
+function formatMarketStatus(value) {
+  const date = value ? new Date(value) : new Date()
+
+  if (Number.isNaN(date.getTime())) {
+    return "Markets Closed"
+  }
+
+  const dateLabel = new Intl.DateTimeFormat("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    timeZone: "Asia/Kolkata"
+  }).format(date)
+
+  return `Markets Closed • ${dateLabel} at IST`
 }
 
 function statusTone(value) {
@@ -245,6 +352,175 @@ function AllocationPie({
   )
 }
 
+function buildTreemapLayout(items, x, y, width, height, depth = 0) {
+  if (!items.length || width <= 0 || height <= 0) {
+    return []
+  }
+
+  if (items.length === 1) {
+    return [
+      {
+        ...items[0],
+        x,
+        y,
+        width,
+        height
+      }
+    ]
+  }
+
+  const total = items.reduce((sum, item) => sum + Number(item.value || 0), 0)
+  if (total <= 0) {
+    return []
+  }
+
+  const isVerticalSplit = (depth % 2 === 0 ? width >= height : width < height)
+  let splitIndex = 0
+  let firstGroupValue = 0
+
+  while (splitIndex < items.length - 1 && firstGroupValue < total / 2) {
+    firstGroupValue += Number(items[splitIndex].value || 0)
+    splitIndex += 1
+  }
+
+  const firstItems = items.slice(0, splitIndex)
+  const secondItems = items.slice(splitIndex)
+  const firstRatio = Math.max(0.08, Math.min(firstGroupValue / total, 0.92))
+
+  if (isVerticalSplit) {
+    const firstWidth = width * firstRatio
+    return [
+      ...buildTreemapLayout(firstItems, x, y, firstWidth, height, depth + 1),
+      ...buildTreemapLayout(secondItems, x + firstWidth, y, width - firstWidth, height, depth + 1)
+    ]
+  }
+
+  const firstHeight = height * firstRatio
+  return [
+    ...buildTreemapLayout(firstItems, x, y, width, firstHeight, depth + 1),
+    ...buildTreemapLayout(secondItems, x, y + firstHeight, width, height - firstHeight, depth + 1)
+  ]
+}
+
+function SectorTreemap({ title, subtitle, items, activeFilter, onSectorSelect }) {
+  const [hovered, setHovered] = useState(null)
+  const treemapRef = useRef(null)
+  const totalCurrentValue = items.reduce((sum, item) => sum + Number(item.currentValue || 0), 0)
+
+  if (!items.length || totalCurrentValue <= 0) {
+    return (
+      <article className="panel">
+        <div className="panel-heading">
+          <div>
+            <p className="panel-kicker">{subtitle}</p>
+            <h3>{title}</h3>
+          </div>
+        </div>
+        <p className="empty-state">No sector allocation data yet.</p>
+      </article>
+    )
+  }
+
+  const sortedItems = [...items].sort((a, b) => Number(b.value || 0) - Number(a.value || 0))
+  const treemap = buildTreemapLayout(sortedItems, 0, 0, 100, 100)
+
+  return (
+    <article className="panel sector-treemap-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="panel-kicker">{subtitle}</p>
+          <h3>{title}</h3>
+        </div>
+        {activeFilter?.type === "sector" ? (
+          <button className="ghost-button" type="button" onClick={() => onSectorSelect(null)}>
+            Back to all
+          </button>
+        ) : null}
+      </div>
+
+      <div className="treemap-wrap" ref={treemapRef}>
+        {treemap.map((item) => {
+          const isActive = activeFilter?.type === "sector" && activeFilter?.value === item.name
+          const tone = Number(item.pnl) >= 0 ? "positive" : "negative"
+
+          return (
+            <button
+              key={item.name}
+              type="button"
+              className={`treemap-node ${tone} ${isActive ? "active" : ""}`}
+              style={{
+                left: `${item.x}%`,
+                top: `${item.y}%`,
+                width: `${item.width}%`,
+                height: `${item.height}%`
+              }}
+              onClick={() => onSectorSelect({ type: "sector", value: item.name })}
+              onMouseEnter={(event) => {
+                const wrapRect = treemapRef.current?.getBoundingClientRect()
+                if (!wrapRect) {
+                  setHovered({ item, x: 16, y: 16 })
+                  return
+                }
+                const nextX = Math.max(
+                  12,
+                  Math.min(event.clientX - wrapRect.left + 10, wrapRect.width - 220)
+                )
+                const nextY = Math.max(
+                  16,
+                  Math.min(event.clientY - wrapRect.top + 10, wrapRect.height - 110)
+                )
+                setHovered({
+                  item,
+                  x: nextX,
+                  y: nextY
+                })
+              }}
+              onMouseMove={(event) => {
+                const wrapRect = treemapRef.current?.getBoundingClientRect()
+                if (!wrapRect) {
+                  return
+                }
+                const nextX = Math.max(
+                  12,
+                  Math.min(event.clientX - wrapRect.left + 10, wrapRect.width - 220)
+                )
+                const nextY = Math.max(
+                  16,
+                  Math.min(event.clientY - wrapRect.top + 10, wrapRect.height - 110)
+                )
+                setHovered({
+                  item,
+                  x: nextX,
+                  y: nextY
+                })
+              }}
+              onMouseLeave={() => setHovered(null)}
+            >
+              <span>{item.name}</span>
+            </button>
+          )
+        })}
+
+        {hovered ? (
+          <div
+            className="treemap-tooltip"
+            style={{
+              left: `${hovered.x}px`,
+              top: `${hovered.y}px`
+            }}
+          >
+            <strong>{hovered.item.name}</strong>
+            <span>Holding: {formatPercent(hovered.item.weightPercent)}</span>
+            <span>Invested: {formatCurrency(hovered.item.invested)}</span>
+            <span>Current: {formatCurrency(hovered.item.currentValue)}</span>
+            <span className={statusTone(hovered.item.pnl)}>P&amp;L: {formatCurrency(hovered.item.pnl)}</span>
+          </div>
+        ) : null}
+      </div>
+    </article>
+  )
+}
+
 function buildLinePath(points, width, height, padding, key, minValue, maxValue) {
   const innerWidth = width - padding.left - padding.right
   const innerHeight = height - padding.top - padding.bottom
@@ -261,42 +537,65 @@ function buildLinePath(points, width, height, padding, key, minValue, maxValue) 
     .join(" ")
 }
 
-function PerformanceChart({ comparison, benchmarkName, overview, benchmark }) {
+function buildPlaceholderPerformancePoints(performancePeriod, overview, benchmark) {
+  const steps = performancePeriod === "5Y" ? 18 : performancePeriod === "3Y" ? 14 : 10
+  const today = new Date()
+  const lookbackYears = performancePeriod === "5Y" ? 5 : performancePeriod === "3Y" ? 3 : 1
+  const start = new Date(today)
+  start.setFullYear(today.getFullYear() - lookbackYears)
+
+  const portfolioTarget =
+    100 + Math.max(-22, Math.min(34, Number(overview?.total_gain_percent ?? 8)))
+  const benchmarkTarget =
+    100 + Math.max(-16, Math.min(24, Number(benchmark?.one_day_change_percent ?? 0) * 7))
+
+  const points = []
+  for (let index = 0; index < steps; index += 1) {
+    const progress = index / (steps - 1)
+    const curve = Math.sin(progress * Math.PI) * 0.8
+    const date = new Date(start)
+    date.setDate(start.getDate() + Math.round(progress * (lookbackYears * 365)))
+
+    const portfolioValue =
+      100 + (portfolioTarget - 100) * progress + curve * 1.5
+    const benchmarkValue =
+      100 + (benchmarkTarget - 100) * progress + curve * 1.1
+
+    points.push({
+      date: date.toISOString().slice(0, 10),
+      portfolio_value: Number(portfolioValue.toFixed(2)),
+      benchmark_value: Number(benchmarkValue.toFixed(2)),
+      portfolio_change_percent: Number((portfolioValue - 100).toFixed(2)),
+      benchmark_change_percent: Number((benchmarkValue - 100).toFixed(2))
+    })
+  }
+
+  return {
+    points,
+    start_date: points[0]?.date || null,
+    end_date: points[points.length - 1]?.date || null
+  }
+}
+
+function PerformanceChart({
+  comparison,
+  benchmarkName,
+  performancePeriod,
+  onPeriodChange,
+  overview,
+  benchmark
+}) {
   let points = comparison?.points ?? []
   let startDate = comparison?.start_date
   let endDate = comparison?.end_date
+  let usingPlaceholder = false
 
   if (points.length < 2) {
-    const portfolioCurrent = Number(overview?.total_net_worth ?? 0)
-    const portfolioOneDayChange = Number(overview?.one_day_change ?? 0)
-    const portfolioPrevious = portfolioCurrent - portfolioOneDayChange
-    const benchmarkPrice = Number(benchmark?.price ?? 0)
-    const benchmarkPrevClose = Number(benchmark?.prev_close ?? 0)
-
-    if (portfolioCurrent > 0 && portfolioPrevious > 0 && benchmarkPrice > 0 && benchmarkPrevClose > 0) {
-      const today = todayInputValue()
-      const yesterday = new Date()
-      yesterday.setDate(yesterday.getDate() - 1)
-      const previousDate = yesterday.toISOString().slice(0, 10)
-      points = [
-        {
-          date: previousDate,
-          portfolio_value: 100,
-          benchmark_value: 100,
-          portfolio_change_percent: 0,
-          benchmark_change_percent: 0
-        },
-        {
-          date: today,
-          portfolio_value: (portfolioCurrent / portfolioPrevious) * 100,
-          benchmark_value: (benchmarkPrice / benchmarkPrevClose) * 100,
-          portfolio_change_percent: ((portfolioCurrent / portfolioPrevious) * 100) - 100,
-          benchmark_change_percent: ((benchmarkPrice / benchmarkPrevClose) * 100) - 100
-        }
-      ]
-      startDate = previousDate
-      endDate = today
-    }
+    const placeholder = buildPlaceholderPerformancePoints(performancePeriod, overview, benchmark)
+    points = placeholder.points
+    startDate = placeholder.start_date
+    endDate = placeholder.end_date
+    usingPlaceholder = points.length >= 2
   }
 
   if (points.length < 2) {
@@ -307,8 +606,22 @@ function PerformanceChart({ comparison, benchmarkName, overview, benchmark }) {
             <p className="panel-kicker">Performance</p>
             <h3>Portfolio vs benchmark</h3>
           </div>
+          <div className="range-chip-group">
+            {["1Y", "3Y", "5Y"].map((period) => (
+              <button
+                key={period}
+                type="button"
+                className={`chip ${performancePeriod === period ? "active" : ""}`}
+                onClick={() => onPeriodChange(period)}
+              >
+                {period}
+              </button>
+            ))}
+          </div>
         </div>
-        <p className="empty-state">Refresh holdings on multiple days to build the normalized performance chart.</p>
+        <p className="empty-state">
+          Not enough snapshot history for {performancePeriod} comparison yet.
+        </p>
       </section>
     )
   }
@@ -337,10 +650,28 @@ function PerformanceChart({ comparison, benchmarkName, overview, benchmark }) {
           <p className="panel-kicker">Performance</p>
           <h3>Portfolio vs benchmark</h3>
         </div>
-        <span>
-          {startDate} to {endDate}
-        </span>
+        <div className="range-controls">
+          <div className="range-chip-group">
+            {["1Y", "3Y", "5Y"].map((period) => (
+              <button
+                key={period}
+                type="button"
+                className={`chip ${performancePeriod === period ? "active" : ""}`}
+                onClick={() => onPeriodChange(period)}
+              >
+                {period}
+              </button>
+            ))}
+          </div>
+          <span>
+            {startDate} to {endDate}
+          </span>
+        </div>
       </div>
+
+      {usingPlaceholder ? (
+        <p className="empty-state">Showing placeholder trend until enough historical snapshots are collected.</p>
+      ) : null}
 
       <div className="performance-split">
         <div className="chart-summary">
@@ -422,16 +753,18 @@ function PerformanceChart({ comparison, benchmarkName, overview, benchmark }) {
   )
 }
 
-function MiniTrendChart({ chart }) {
+function MiniTrendChart({ chart, compact = false }) {
   const points = chart?.points ?? []
 
   if (points.length < 2) {
     return null
   }
 
-  const width = 150
-  const height = 44
-  const padding = { top: 6, right: 4, bottom: 6, left: 4 }
+  const width = compact ? 120 : 150
+  const height = compact ? 30 : 44
+  const padding = compact
+    ? { top: 4, right: 4, bottom: 4, left: 4 }
+    : { top: 6, right: 4, bottom: 6, left: 4 }
   const values = points.map((point) => point.value)
   const minValue = Math.min(...values)
   const maxValue = Math.max(...values)
@@ -445,7 +778,7 @@ function MiniTrendChart({ chart }) {
       : null
 
   return (
-    <article className={`mini-chart-card ${chart.trend || ""}`}>
+    <article className={`mini-chart-card ${chart.trend || ""} ${compact ? "compact" : ""}`}>
       <div className="mini-chart-head">
         <div>
           <span>{chart.name}</span>
@@ -472,6 +805,182 @@ function MiniTrendChart({ chart }) {
         <path d={path} className={`mini-chart-line ${chart.trend || ""}`} />
       </svg>
     </article>
+  )
+}
+
+function MarketTicker({ items }) {
+  const repeatedItems = [...items, ...items]
+
+  return (
+    <section className="market-ticker" aria-label="Nifty 50 daily movement">
+      <div className="ticker-track">
+        {repeatedItems.map((item, index) => (
+          <div key={`${item.symbol}-${index}`} className="ticker-item">
+            <span className="ticker-symbol">{item.name}</span>
+            <strong className={statusTone(item.change)}>
+              {formatSignedNumber(item.change)}%
+            </strong>
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function MarketSentimentCard({ benchmark, overview }) {
+  const niftyMove = Number(benchmark?.one_day_change_percent ?? 0)
+  let score = 5
+  let tone = "uncertain"
+  let label = "Uncertain Sentiment"
+
+  if (niftyMove > 1) {
+    tone = "bullish"
+    label = "Bullish Sentiment"
+    const momentum = Math.min((niftyMove - 1) / 1.5, 1)
+    score = 8 + Math.round(momentum * 2)
+  } else if (niftyMove > 0.3) {
+    tone = "bullish"
+    label = "Bullish Sentiment"
+    const momentum = Math.min((niftyMove - 0.3) / 0.7, 1)
+    score = 6 + Math.round(momentum * 2)
+  } else if (niftyMove > -0.2) {
+    tone = "uncertain"
+    label = "Uncertain Sentiment"
+    const momentum = (niftyMove + 0.2) / 0.5
+    score = 4 + Math.round(Math.max(0, Math.min(momentum, 1)) * 2)
+  } else {
+    tone = "bearish"
+    label = "Bearish Sentiment"
+    const severity = Math.max(0, Math.min(Math.abs(niftyMove + 0.2), 1.8))
+    score = Math.max(1, 3 - Math.floor(severity / 0.8))
+  }
+
+  return (
+    <article className={`panel sentiment-card ${tone}`}>
+      <div className="sentiment-meter" aria-hidden="true">
+        {Array.from({ length: 10 }).map((_, index) => (
+          <span
+            key={index}
+            className={`sentiment-bar ${index < score ? `active ${tone}` : ""}`}
+          />
+        ))}
+      </div>
+      <h3>{label}</h3>
+      <p>{formatMarketStatus(overview?.as_of)}</p>
+    </article>
+  )
+}
+
+function MarketNewsPanel({ items }) {
+  return (
+    <section className="panel market-news-panel">
+      <div className="panel-heading">
+        <div>
+          <p className="panel-kicker">Market News</p>
+          <h3>Portfolio highlights</h3>
+        </div>
+      </div>
+
+      <div className="news-scroll">
+        {items.map((item) => (
+          <article key={item.id} className="news-item">
+            <h4>{item.headline}</h4>
+            <p>{item.highlight}</p>
+            <p className="news-key">{item.keyDetail}</p>
+            <div className="news-meta">
+              <span>
+                {item.source} · {item.publishedAt}
+              </span>
+              <a href={item.url} target="_blank" rel="noreferrer">
+                Read full
+              </a>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function PriceAlertModal({ open, onClose, form, onChange }) {
+  if (!open) {
+    return null
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Create stock price alert"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="panel-heading modal-heading">
+          <div>
+            <p className="panel-kicker">Price alert</p>
+            <h3>Create stock alert</h3>
+          </div>
+          <button className="ghost-button" type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        <form className="transaction-form" onSubmit={(event) => event.preventDefault()}>
+          <label>
+            <span>Stock symbol</span>
+            <input
+              name="symbol"
+              type="text"
+              placeholder="e.g. RELIANCE"
+              value={form.symbol}
+              onChange={onChange}
+            />
+          </label>
+          <label>
+            <span>Target price (INR)</span>
+            <input
+              name="targetPrice"
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="e.g. 3050"
+              value={form.targetPrice}
+              onChange={onChange}
+            />
+          </label>
+          <label>
+            <span>Duration</span>
+            <select name="duration" value={form.duration} onChange={onChange}>
+              <option value="1_WEEK">1 week</option>
+              <option value="1_MONTH">1 month</option>
+              <option value="3_MONTHS">3 months</option>
+              <option value="UNTIL_HIT">Until target hit</option>
+            </select>
+          </label>
+          <label>
+            <span>Alert channel</span>
+            <select name="channel" value={form.channel} onChange={onChange}>
+              <option value="IN_APP">In-app notification</option>
+              <option value="EMAIL">Email notification</option>
+              <option value="BOTH">Email + in-app</option>
+            </select>
+          </label>
+          <div className="modal-note">
+            Placeholder feature: we have added the UI only. Trigger logic, notification engine, and
+            email delivery will be implemented in the next phase.
+          </div>
+          <div className="modal-actions">
+            <button className="ghost-button" type="button" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="secondary-button" type="button" disabled>
+              Save alert (coming soon)
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
   )
 }
 
@@ -616,6 +1125,18 @@ function App() {
   const [activeActionSymbol, setActiveActionSymbol] = useState(null)
   const [transactionHolding, setTransactionHolding] = useState(null)
   const [sipHolding, setSipHolding] = useState(null)
+  const [searchTerm, setSearchTerm] = useState("")
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
+  const [themeMode, setThemeMode] = useState("dark")
+  const [performancePeriod, setPerformancePeriod] = useState("1Y")
+  const [priceAlertOpen, setPriceAlertOpen] = useState(false)
+  const [priceAlertForm, setPriceAlertForm] = useState({
+    symbol: "",
+    targetPrice: "",
+    duration: "1_MONTH",
+    channel: "IN_APP"
+  })
+  const uploadInputRef = useRef(null)
   const [transactionForm, setTransactionForm] = useState({
     type: "BUY",
     quantity: "",
@@ -627,7 +1148,11 @@ function App() {
     start_date: todayInputValue()
   })
 
-  const loadDashboard = useCallback(async (selectedCategory = category, showLoader = true) => {
+  const loadDashboard = useCallback(async (
+    selectedCategory = category,
+    showLoader = true,
+    selectedPerformancePeriod = performancePeriod
+  ) => {
     if (showLoader) {
       setLoading(true)
     } else {
@@ -637,7 +1162,7 @@ function App() {
     setError("")
 
     try {
-      const data = await getImportedDashboard(selectedCategory)
+      const data = await getImportedDashboard(selectedCategory, selectedPerformancePeriod)
       setDashboard(data)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load imported portfolio")
@@ -645,11 +1170,18 @@ function App() {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [category])
+  }, [category, performancePeriod])
 
   useEffect(() => {
-    loadDashboard(category, true)
-  }, [category, loadDashboard])
+    loadDashboard(category, true, performancePeriod)
+  }, [category, performancePeriod, loadDashboard])
+
+  useEffect(() => {
+    document.body.dataset.theme = themeMode
+    return () => {
+      delete document.body.dataset.theme
+    }
+  }, [themeMode])
 
   async function handleUpload(event) {
     const file = event.target.files?.[0]
@@ -821,60 +1353,197 @@ function App() {
   const performanceComparison = dashboard?.performance_comparison
   const recurringSips = dashboard?.recurring_sips ?? []
   const assetAllocation = dashboard?.asset_allocation ?? []
-  const sectorAllocation = dashboard?.sector_allocation ?? []
   const categories = overview?.available_categories ?? ["ALL"]
 
   const filteredHoldings = useMemo(() => {
-    if (!allocationFilter) {
-      return holdings
+    let nextHoldings = holdings
+
+    if (allocationFilter?.type === "asset") {
+      nextHoldings = nextHoldings.filter((holding) => holding.asset_type === allocationFilter.value)
+    } else if (allocationFilter?.type === "sector") {
+      nextHoldings = nextHoldings.filter(
+        (holding) => (holding.sector || "Unclassified") === allocationFilter.value
+      )
     }
 
-    if (allocationFilter.type === "asset") {
-      return holdings.filter((holding) => holding.asset_type === allocationFilter.value)
+    const query = searchTerm.trim().toLowerCase()
+    if (!query) {
+      return nextHoldings
     }
 
-    if (allocationFilter.type === "sector") {
-      return holdings.filter((holding) => (holding.sector || "Unclassified") === allocationFilter.value)
+    return nextHoldings.filter((holding) => {
+      const haystack = [
+        holding.company_name,
+        holding.symbol,
+        holding.sector,
+        holding.asset_type
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+
+      return haystack.includes(query)
+    })
+  }, [allocationFilter, holdings, searchTerm])
+  const sectorTreemapItems = useMemo(() => {
+    const bySector = new Map()
+
+    for (const holding of holdings) {
+      const sectorName = holding.sector || "Unclassified"
+      const invested = Number(holding.invested_amount || 0)
+      const currentValue = Number(holding.current_value || 0)
+      const pnl =
+        holding.unrealized_pnl !== null && holding.unrealized_pnl !== undefined
+          ? Number(holding.unrealized_pnl || 0)
+          : currentValue - invested
+
+      const current = bySector.get(sectorName) || {
+        name: sectorName,
+        invested: 0,
+        currentValue: 0,
+        pnl: 0
+      }
+
+      current.invested += invested
+      current.currentValue += currentValue
+      current.pnl += pnl
+      bySector.set(sectorName, current)
     }
 
-    return holdings
-  }, [allocationFilter, holdings])
+    const totalCurrent = Array.from(bySector.values()).reduce(
+      (sum, item) => sum + item.currentValue,
+      0
+    )
+
+    return Array.from(bySector.values()).map((item) => ({
+      ...item,
+      value: item.currentValue,
+      weightPercent: totalCurrent > 0 ? (item.currentValue / totalCurrent) * 100 : 0
+    }))
+  }, [holdings])
 
   const filterLabel = allocationFilter
     ? `${allocationFilter.type === "asset" ? "Asset" : "Sector"}: ${allocationFilter.value}`
     : null
+  const marketTickerItems = useMemo(() => {
+    if (!holdings.length) {
+      return NIFTY_50_TICKER_ITEMS
+    }
+
+    const holdingChangeBySymbol = new Map(
+      holdings.map((holding) => {
+        const previousValue =
+          Number(holding.current_value ?? 0) - Number(holding.one_day_change ?? 0)
+        const percentChange =
+          previousValue > 0
+            ? (Number(holding.one_day_change ?? 0) / previousValue) * 100
+            : null
+
+        return [holding.symbol, percentChange]
+      })
+    )
+
+    return NIFTY_50_TICKER_ITEMS.map((item) => ({
+      ...item,
+      change: holdingChangeBySymbol.get(item.symbol) ?? item.change
+    }))
+  }, [holdings])
+
+  function jumpToHoldings() {
+    const holdingsSection = document.getElementById("holdings-section")
+    if (holdingsSection) {
+      holdingsSection.scrollIntoView({ behavior: "smooth", block: "start" })
+    }
+  }
+
+  function handlePriceAlertChange(event) {
+    const { name, value } = event.target
+    setPriceAlertForm((current) => ({
+      ...current,
+      [name]: value
+    }))
+  }
 
   return (
-    <div className="app-shell">
-      <section className="hero">
-        <div>
-          <p className="eyebrow">Automated Portfolio Tracking</p>
-          <h1>Upload broker holdings. Refresh market data. Read the portfolio in one glance.</h1>
-          <p className="hero-copy">
-            This dashboard is centered on broker-file imports instead of manual trade entry.
-            It computes live net worth, one-day movement, allocations, stock-level details,
-            and Nifty 50 comparison from the imported snapshot.
-          </p>
-        </div>
+    <div className={`app-shell ${themeMode === "light" ? "light-theme" : "dark-theme"}`}>
+      <MarketTicker items={marketTickerItems} />
 
-        <div className="hero-actions">
-          <label className="upload-card">
-            <span>Import broker holdings (.xlsx)</span>
-            <input type="file" accept=".xlsx" onChange={handleUpload} disabled={uploading} />
-            <strong>{uploading ? "Importing..." : "Choose file"}</strong>
-          </label>
+      <header className="app-header">
+        <div className="header-brand">Portfolio Tracker</div>
 
-          <button className="secondary-button" onClick={handleRefresh} disabled={refreshing || !dashboard}>
-            {refreshing ? "Refreshing..." : "Refresh latest prices"}
+        <label className="header-search">
+          <input
+            type="search"
+            placeholder="Search stocks, symbols, sectors..."
+            value={searchTerm}
+            onChange={(event) => setSearchTerm(event.target.value)}
+          />
+        </label>
+
+        <div className="header-actions">
+          <button
+            type="button"
+            className="header-link theme-toggle"
+            onClick={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}
+          >
+            {themeMode === "dark" ? "Light" : "Dark"}
           </button>
-
-          <div className="hero-meta">
-            <span>Latest import</span>
-            <strong>{dashboard?.import_file_name || "No file imported yet"}</strong>
-            <span>{dashboard?.imported_at ? formatDateTime(dashboard.imported_at) : "Upload a holdings workbook to begin."}</span>
+          <button
+            type="button"
+            className="header-link"
+            onClick={() => setPriceAlertOpen(true)}
+          >
+            Price Alerts
+          </button>
+          <button type="button" className="header-link" onClick={jumpToHoldings}>
+            Holdings
+          </button>
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Refresh market data"
+            onClick={handleRefresh}
+            disabled={refreshing || !dashboard}
+          >
+            <svg viewBox="0 0 24 24" role="presentation" focusable="false">
+              <path d="M17.6 6.3A7 7 0 1 0 19 13h-2a5 5 0 1 1-1-4l-2 2h6V5l-2.4 1.3Z" />
+            </svg>
+          </button>
+          <div className="account-wrap">
+            <button
+              type="button"
+              className="header-link"
+              onClick={() => setAccountMenuOpen((open) => !open)}
+            >
+              Login / Signup
+            </button>
+            {accountMenuOpen ? (
+              <div className="account-menu">
+                <button type="button">Profile</button>
+                <button type="button">Account settings</button>
+                <button type="button">Support</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    uploadInputRef.current?.click()
+                    setAccountMenuOpen(false)
+                  }}
+                >
+                  {uploading ? "Uploading..." : "Upload holdings file"}
+                </button>
+              </div>
+            ) : null}
           </div>
         </div>
-      </section>
+      </header>
+      <input
+        ref={uploadInputRef}
+        className="hidden-file-input"
+        type="file"
+        accept=".xlsx"
+        onChange={handleUpload}
+        disabled={uploading}
+      />
 
       {error ? <div className="banner error-banner">{error}</div> : null}
       {notice ? <div className="banner success-banner">{notice}</div> : null}
@@ -892,6 +1561,94 @@ function App() {
         </section>
       ) : (
         <>
+          <section className="market-overview-grid">
+            <div className="market-overview-stack">
+              <section className="panel benchmark-panel top-benchmark-panel">
+                <div className="panel-heading">
+                  <div>
+                    <p className="panel-kicker">Benchmarks</p>
+                    <h3>Nifty 50 and Sensex today</h3>
+                  </div>
+                  <span>{overview.as_of ? formatDateTime(overview.as_of) : benchmark?.symbol || "^NSEI"}</span>
+                </div>
+
+                <div className="benchmark-top-layout">
+                  <div className="benchmark-mini-stack">
+                    {benchmarkCharts.map((chart) => (
+                      <MiniTrendChart key={chart.symbol} chart={chart} compact />
+                    ))}
+                  </div>
+
+                  <div className="benchmark-metrics">
+                    <div className="benchmark-grid">
+                      <div className="metric-card benchmark-card">
+                        <span>1D move</span>
+                        <strong className={statusTone(benchmark?.one_day_change_percent ?? 0)}>
+                          {benchmark?.one_day_change_percent !== null ? formatPercent(benchmark.one_day_change_percent) : "N/A"}
+                        </strong>
+                      </div>
+                      <div className="metric-card benchmark-card">
+                        <span>Index P/E</span>
+                        <strong>{benchmark?.pe_ratio !== null ? formatNumber(benchmark.pe_ratio, 2) : "N/A"}</strong>
+                      </div>
+                      <div className="metric-card benchmark-card">
+                        <span>Portfolio vs index 1D</span>
+                        <strong className={statusTone((overview.one_day_change_percent ?? 0) - (benchmark?.one_day_change_percent ?? 0))}>
+                          {benchmark?.one_day_change_percent !== null
+                            ? formatPercent(overview.one_day_change_percent - benchmark.one_day_change_percent)
+                            : "N/A"}
+                        </strong>
+                      </div>
+                      <div className="metric-card benchmark-card">
+                        <span>Sharpe ratio</span>
+                        <strong>
+                          {riskMetrics?.sharpe_ratio !== null && riskMetrics?.sharpe_ratio !== undefined
+                            ? formatNumber(riskMetrics.sharpe_ratio, 2)
+                            : "N/A"}
+                        </strong>
+                      </div>
+                      <div className="metric-card benchmark-card">
+                        <span>Beta</span>
+                        <strong>
+                          {riskMetrics?.beta !== null && riskMetrics?.beta !== undefined
+                            ? formatNumber(riskMetrics.beta, 2)
+                            : "N/A"}
+                        </strong>
+                      </div>
+                      <div className="metric-card benchmark-card">
+                        <span>Alpha</span>
+                        <strong className={statusTone(riskMetrics?.alpha_annualized_percent ?? 0)}>
+                          {riskMetrics?.alpha_annualized_percent !== null && riskMetrics?.alpha_annualized_percent !== undefined
+                            ? formatPercent(riskMetrics.alpha_annualized_percent)
+                            : "N/A"}
+                        </strong>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <PerformanceChart
+                comparison={performanceComparison}
+                benchmarkName={benchmark?.name || benchmark?.symbol || "Benchmark"}
+                performancePeriod={performancePeriod}
+                overview={overview}
+                benchmark={benchmark}
+                onPeriodChange={(nextPeriod) => {
+                  if (nextPeriod === performancePeriod) {
+                    return
+                  }
+                  setPerformancePeriod(nextPeriod)
+                }}
+              />
+            </div>
+
+            <div className="market-side-panel">
+              <MarketSentimentCard benchmark={benchmark} overview={overview} />
+              <MarketNewsPanel items={MARKET_NEWS_ITEMS} />
+            </div>
+          </section>
+
           <section className="toolbar">
             <div className="chip-group">
               {categories.map((option) => {
@@ -941,77 +1698,6 @@ function App() {
             </article>
           </section>
 
-          <section className="panel benchmark-panel">
-            <div className="panel-heading">
-              <div>
-                <p className="panel-kicker">Benchmark</p>
-                <h3>Nifty 50 comparison</h3>
-              </div>
-              <span>{benchmark?.symbol || "^NSEI"}</span>
-            </div>
-
-            <div className="benchmark-layout">
-              <div className="benchmark-metrics">
-                <div className="benchmark-grid">
-                  <div className="metric-card benchmark-card">
-                    <span>1D move</span>
-                    <strong className={statusTone(benchmark?.one_day_change_percent ?? 0)}>
-                      {benchmark?.one_day_change_percent !== null ? formatPercent(benchmark.one_day_change_percent) : "N/A"}
-                    </strong>
-                  </div>
-                  <div className="metric-card benchmark-card">
-                    <span>Index P/E</span>
-                    <strong>{benchmark?.pe_ratio !== null ? formatNumber(benchmark.pe_ratio, 2) : "N/A"}</strong>
-                  </div>
-                  <div className="metric-card benchmark-card">
-                    <span>Portfolio vs index 1D</span>
-                    <strong className={statusTone((overview.one_day_change_percent ?? 0) - (benchmark?.one_day_change_percent ?? 0))}>
-                      {benchmark?.one_day_change_percent !== null
-                        ? formatPercent(overview.one_day_change_percent - benchmark.one_day_change_percent)
-                        : "N/A"}
-                    </strong>
-                  </div>
-                  <div className="metric-card benchmark-card">
-                    <span>Sharpe ratio</span>
-                    <strong>
-                      {riskMetrics?.sharpe_ratio !== null && riskMetrics?.sharpe_ratio !== undefined
-                        ? formatNumber(riskMetrics.sharpe_ratio, 2)
-                        : "N/A"}
-                    </strong>
-                  </div>
-                  <div className="metric-card benchmark-card">
-                    <span>Beta</span>
-                    <strong>
-                      {riskMetrics?.beta !== null && riskMetrics?.beta !== undefined
-                        ? formatNumber(riskMetrics.beta, 2)
-                        : "N/A"}
-                    </strong>
-                  </div>
-                  <div className="metric-card benchmark-card">
-                    <span>Alpha</span>
-                    <strong className={statusTone(riskMetrics?.alpha_annualized_percent ?? 0)}>
-                      {riskMetrics?.alpha_annualized_percent !== null && riskMetrics?.alpha_annualized_percent !== undefined
-                        ? formatPercent(riskMetrics.alpha_annualized_percent)
-                        : "N/A"}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-              <div className="benchmark-empty">
-                {benchmarkCharts.map((chart) => (
-                  <MiniTrendChart key={chart.symbol} chart={chart} />
-                ))}
-              </div>
-            </div>
-          </section>
-
-          <PerformanceChart
-            comparison={performanceComparison}
-            benchmarkName={benchmark?.name || benchmark?.symbol || "Benchmark"}
-            overview={overview}
-            benchmark={benchmark}
-          />
-
           <section className="panel-grid">
             <AllocationPie
               title="Asset weightage"
@@ -1021,17 +1707,16 @@ function App() {
               activeFilter={allocationFilter}
               onSliceSelect={setAllocationFilter}
             />
-            <AllocationPie
+            <SectorTreemap
               title="Sector allocation"
               subtitle="Diversification"
-              items={sectorAllocation}
-              filterType="sector"
+              items={sectorTreemapItems}
               activeFilter={allocationFilter}
-              onSliceSelect={setAllocationFilter}
+              onSectorSelect={setAllocationFilter}
             />
           </section>
 
-          <section className="panel">
+          <section className="panel" id="holdings-section">
             <div className="panel-heading">
               <div>
                 <p className="panel-kicker">Stock details</p>
@@ -1147,6 +1832,12 @@ function App() {
         onClose={closeSipModal}
         onSubmit={handleSipSubmit}
         submitting={submittingTransaction}
+      />
+      <PriceAlertModal
+        open={priceAlertOpen}
+        onClose={() => setPriceAlertOpen(false)}
+        form={priceAlertForm}
+        onChange={handlePriceAlertChange}
       />
     </div>
   )

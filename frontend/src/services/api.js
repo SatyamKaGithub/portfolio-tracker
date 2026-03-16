@@ -131,8 +131,8 @@ export async function addRecurringSip(payload) {
   })
 }
 
-export async function getImportedDashboard(category = "ALL") {
+export async function getImportedDashboard(category = "ALL", performancePeriod = "1Y") {
   return request(
-    `/portfolio/imported-dashboard?category=${encodeURIComponent(category)}`
+    `/portfolio/imported-dashboard?category=${encodeURIComponent(category)}&performance_period=${encodeURIComponent(performancePeriod)}`
   )
 }

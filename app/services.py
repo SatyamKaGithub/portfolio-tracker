@@ -1,6 +1,9 @@
 from datetime import date, datetime, timedelta
 import math
-from typing import Dict, List, Optional
+import re
+import time
+from typing import Dict, List, Optional, Tuple
+from urllib import request as urlrequest
 
 import pandas as pd
 import yfinance as yf
@@ -27,6 +30,13 @@ from app.schemas import (
 )
 
 EPSILON = 1e-9
+AMFI_NAV_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
+AMFI_NAV_CACHE_TTL_SECONDS = 60 * 30
+_AMFI_NAV_CACHE: Dict[str, object] = {
+    "loaded_at": 0.0,
+    "by_isin": {},
+    "rows": [],
+}
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -808,6 +818,122 @@ def _display_asset_type(value: str) -> str:
     return "Stock"
 
 
+def _is_mutual_fund_holding(holding: ImportedHolding) -> bool:
+    if (holding.asset_type or "").strip().upper() == "MUTUAL_FUND":
+        return True
+    isin_text = (holding.isin or "").strip().upper()
+    if isin_text.startswith("INF"):
+        return True
+    symbol_text = (holding.symbol or "").strip().upper()
+    return "FUND" in symbol_text
+
+
+def _normalize_fund_name(value: Optional[str]) -> str:
+    text = (value or "").strip().upper()
+    text = re.sub(r"\bPLAN\b", "", text)
+    text = re.sub(r"\bDIRECT\b", "", text)
+    text = re.sub(r"\bREGULAR\b", "", text)
+    text = re.sub(r"\bGROWTH\b", "", text)
+    text = re.sub(r"\bOPTION\b", "", text)
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
+def _load_amfi_nav_cache() -> Tuple[Dict[str, Dict[str, object]], List[Dict[str, object]]]:
+    now = time.time()
+    loaded_at = float(_AMFI_NAV_CACHE.get("loaded_at") or 0.0)
+    if (
+        now - loaded_at < AMFI_NAV_CACHE_TTL_SECONDS
+        and _AMFI_NAV_CACHE.get("rows")
+    ):
+        return (
+            _AMFI_NAV_CACHE.get("by_isin", {}),
+            _AMFI_NAV_CACHE.get("rows", []),
+        )
+
+    by_isin: Dict[str, Dict[str, object]] = {}
+    rows: List[Dict[str, object]] = []
+
+    try:
+        with urlrequest.urlopen(AMFI_NAV_URL, timeout=8) as response:
+            payload = response.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return (
+            _AMFI_NAV_CACHE.get("by_isin", {}),
+            _AMFI_NAV_CACHE.get("rows", []),
+        )
+
+    for line in payload.splitlines():
+        parts = [part.strip() for part in line.split(";")]
+        if len(parts) < 6:
+            continue
+
+        scheme_code, isin_growth, isin_reinvest, scheme_name, nav_text, nav_date = parts[:6]
+        try:
+            nav = float(nav_text.replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+
+        if not math.isfinite(nav) or nav <= 0:
+            continue
+
+        row = {
+            "scheme_code": scheme_code,
+            "scheme_name": scheme_name,
+            "nav": nav,
+            "date": nav_date,
+            "name_key": _normalize_fund_name(scheme_name),
+        }
+        rows.append(row)
+
+        for isin in (isin_growth, isin_reinvest):
+            isin_key = (isin or "").strip().upper()
+            if isin_key and isin_key.startswith("INF"):
+                by_isin[isin_key] = row
+
+    _AMFI_NAV_CACHE["loaded_at"] = now
+    _AMFI_NAV_CACHE["by_isin"] = by_isin
+    _AMFI_NAV_CACHE["rows"] = rows
+    return by_isin, rows
+
+
+def _fetch_mutual_fund_snapshot(holding: ImportedHolding) -> Dict[str, Optional[float] | str]:
+    by_isin, rows = _load_amfi_nav_cache()
+    isin_key = (holding.isin or "").strip().upper()
+    matched = by_isin.get(isin_key)
+
+    if matched is None:
+        search_keys = [
+            _normalize_fund_name(holding.symbol),
+            _normalize_fund_name(holding.company_name),
+        ]
+        search_keys = [key for key in search_keys if key]
+        for row in rows:
+            name_key = str(row.get("name_key") or "")
+            if any(key in name_key or name_key in key for key in search_keys):
+                matched = row
+                break
+
+    if not matched:
+        return {}
+
+    nav = _first_finite(matched.get("nav"))
+    if nav is None:
+        return {}
+
+    prev_close = _first_finite(holding.current_price, nav)
+
+    return {
+        "exchange_symbol": f"AMFI:{matched.get('scheme_code')}",
+        "current_price": nav,
+        "prev_close": prev_close,
+        "company_name": str(matched.get("scheme_name") or holding.company_name or ""),
+        "sector": "Mutual Fund",
+        "geography": "India",
+        "quote_type": "MUTUALFUND",
+        "pe_ratio": None,
+    }
+
+
 def _candidate_market_symbols(holding: ImportedHolding) -> List[str]:
     if holding.exchange_symbol:
         return [holding.exchange_symbol]
@@ -823,6 +949,11 @@ def _candidate_market_symbols(holding: ImportedHolding) -> List[str]:
 
 
 def _fetch_quote_snapshot(holding: ImportedHolding) -> Dict[str, Optional[float] | str]:
+    if _is_mutual_fund_holding(holding):
+        mutual_fund_snapshot = _fetch_mutual_fund_snapshot(holding)
+        if mutual_fund_snapshot:
+            return mutual_fund_snapshot
+
     for candidate in _candidate_market_symbols(holding):
         try:
             ticker = yf.Ticker(candidate)
@@ -1626,56 +1757,12 @@ def _build_normalized_performance_comparison(
     db: Session,
     benchmark_symbol: str = "^NSEI",
     snapshot_model=PortfolioSnapshot,
+    performance_period: str = "1Y",
 ) -> Dict[str, object]:
+    period_key = (performance_period or "1Y").strip().upper()
+    lookback_years = {"1Y": 1, "3Y": 3, "5Y": 5}.get(period_key, 1)
+
     snapshots = db.query(snapshot_model).order_by(snapshot_model.date.asc()).all()
-    if snapshot_model is ImportedPortfolioSnapshot and len(snapshots) < 2:
-        holdings = db.query(ImportedHolding).all()
-        total_current_value = sum(_safe_number(holding.current_value) for holding in holdings)
-        total_one_day_change = sum(_safe_number(holding.one_day_change) for holding in holdings)
-        previous_value = total_current_value - total_one_day_change
-        if previous_value <= 0:
-            previous_value = sum(_safe_number(holding.invested_amount) for holding in holdings)
-
-        try:
-            benchmark_history = yf.Ticker(benchmark_symbol).history(period="5d", auto_adjust=True)
-        except Exception:
-            benchmark_history = pd.DataFrame()
-
-        if (
-            not benchmark_history.empty
-            and "Close" in benchmark_history
-            and total_current_value > 0
-            and previous_value > 0
-        ):
-            benchmark_close = pd.to_numeric(benchmark_history["Close"], errors="coerce").dropna()
-            if len(benchmark_close) >= 2:
-                start_date = pd.to_datetime(benchmark_close.index[-2]).date()
-                end_date = pd.to_datetime(benchmark_close.index[-1]).date()
-                benchmark_start = float(benchmark_close.iloc[-2])
-                benchmark_end = float(benchmark_close.iloc[-1])
-                if benchmark_start > 0 and benchmark_end > 0:
-                    return {
-                        "benchmark": benchmark_symbol,
-                        "points": [
-                            {
-                                "date": start_date.isoformat(),
-                                "portfolio_value": 100.0,
-                                "benchmark_value": 100.0,
-                                "portfolio_change_percent": 0.0,
-                                "benchmark_change_percent": 0.0,
-                            },
-                            {
-                                "date": end_date.isoformat(),
-                                "portfolio_value": round((total_current_value / previous_value) * 100, 2),
-                                "benchmark_value": round((benchmark_end / benchmark_start) * 100, 2),
-                                "portfolio_change_percent": round(((total_current_value / previous_value) * 100) - 100, 2),
-                                "benchmark_change_percent": round(((benchmark_end / benchmark_start) * 100) - 100, 2),
-                            },
-                        ],
-                        "start_date": start_date.isoformat(),
-                        "end_date": end_date.isoformat(),
-                        "observations": 2,
-                    }
 
     if len(snapshots) < 2:
         return {
@@ -1686,10 +1773,32 @@ def _build_normalized_performance_comparison(
             "observations": 0,
         }
 
+    snapshot_dates = [
+        snapshot.date
+        for snapshot in snapshots
+        if snapshot.date is not None
+    ]
+    if len(snapshot_dates) < 2:
+        return {
+            "benchmark": benchmark_symbol,
+            "points": [],
+            "start_date": None,
+            "end_date": None,
+            "observations": 0,
+        }
+
+    latest_snapshot_date = max(snapshot_dates)
+    lookback_start = latest_snapshot_date - timedelta(days=lookback_years * 365)
+
     snapshot_rows = [
         {"date": snapshot.date, "portfolio_value": _safe_number(snapshot.total_value)}
         for snapshot in snapshots
-        if snapshot.date and snapshot.total_value is not None and _safe_number(snapshot.total_value) >= 0
+        if (
+            snapshot.date
+            and snapshot.date >= lookback_start
+            and snapshot.total_value is not None
+            and _safe_number(snapshot.total_value) >= 0
+        )
     ]
     if len(snapshot_rows) < 2:
         return {
@@ -1812,7 +1921,11 @@ def _build_normalized_performance_comparison(
     }
 
 
-def get_imported_portfolio_dashboard(db: Session, category: str = "ALL"):
+def get_imported_portfolio_dashboard(
+    db: Session,
+    category: str = "ALL",
+    performance_period: str = "1Y",
+):
     _ensure_imported_snapshot_history(db)
     process_due_sips(db)
     normalized_category = category.strip().upper() if category else "ALL"
@@ -1891,7 +2004,12 @@ def get_imported_portfolio_dashboard(db: Session, category: str = "ALL"):
             _fetch_benchmark_mini_chart("^BSESN", "Sensex"),
         ],
         "risk_metrics": risk_metrics,
-        "performance_comparison": _build_normalized_performance_comparison(db, "^NSEI", snapshot_model=ImportedPortfolioSnapshot),
+        "performance_comparison": _build_normalized_performance_comparison(
+            db,
+            "^NSEI",
+            snapshot_model=ImportedPortfolioSnapshot,
+            performance_period=performance_period,
+        ),
         "recurring_sips": [
             {
                 "id": sip.id,
