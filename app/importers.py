@@ -318,12 +318,6 @@ def _normalize_asset_type(value: str, isin: Optional[str] = None, symbol: Option
     if "fund" in normalized or "mutual" in normalized or normalized == "mf":
         return "MUTUAL_FUND"
 
-    if "indexfund" in normalized:
-        return "MUTUAL_FUND"
-
-    if "mutual" in normalized or normalized == "mf":
-        return "MUTUAL_FUND"
-
     if normalized == "etf" or normalized.endswith("etf"):
         return "ETF"
 

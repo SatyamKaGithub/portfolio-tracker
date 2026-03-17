@@ -19,21 +19,6 @@ const PIE_COLORS = [
   "#EDC948"
 ]
 
-const NIFTY_50_TICKER_ITEMS = [
-  { symbol: "RELIANCE", name: "Reliance", change: 1.18 },
-  { symbol: "HDFCBANK", name: "HDFC Bank", change: -0.42 },
-  { symbol: "ICICIBANK", name: "ICICI Bank", change: 0.84 },
-  { symbol: "INFY", name: "Infosys", change: -0.31 },
-  { symbol: "TCS", name: "TCS", change: 0.47 },
-  { symbol: "LT", name: "L&T", change: 1.06 },
-  { symbol: "ITC", name: "ITC", change: -0.18 },
-  { symbol: "SBIN", name: "SBI", change: 0.93 },
-  { symbol: "BHARTIARTL", name: "Airtel", change: 0.58 },
-  { symbol: "KOTAKBANK", name: "Kotak", change: -0.27 },
-  { symbol: "AXISBANK", name: "Axis Bank", change: 0.39 },
-  { symbol: "ASIANPAINT", name: "Asian Paints", change: -0.62 }
-]
-
 const MARKET_NEWS_ITEMS = [
   {
     id: "news-1",
@@ -537,66 +522,15 @@ function buildLinePath(points, width, height, padding, key, minValue, maxValue) 
     .join(" ")
 }
 
-function buildPlaceholderPerformancePoints(performancePeriod, overview, benchmark) {
-  const steps = performancePeriod === "5Y" ? 18 : performancePeriod === "3Y" ? 14 : 10
-  const today = new Date()
-  const lookbackYears = performancePeriod === "5Y" ? 5 : performancePeriod === "3Y" ? 3 : 1
-  const start = new Date(today)
-  start.setFullYear(today.getFullYear() - lookbackYears)
-
-  const portfolioTarget =
-    100 + Math.max(-22, Math.min(34, Number(overview?.total_gain_percent ?? 8)))
-  const benchmarkTarget =
-    100 + Math.max(-16, Math.min(24, Number(benchmark?.one_day_change_percent ?? 0) * 7))
-
-  const points = []
-  for (let index = 0; index < steps; index += 1) {
-    const progress = index / (steps - 1)
-    const curve = Math.sin(progress * Math.PI) * 0.8
-    const date = new Date(start)
-    date.setDate(start.getDate() + Math.round(progress * (lookbackYears * 365)))
-
-    const portfolioValue =
-      100 + (portfolioTarget - 100) * progress + curve * 1.5
-    const benchmarkValue =
-      100 + (benchmarkTarget - 100) * progress + curve * 1.1
-
-    points.push({
-      date: date.toISOString().slice(0, 10),
-      portfolio_value: Number(portfolioValue.toFixed(2)),
-      benchmark_value: Number(benchmarkValue.toFixed(2)),
-      portfolio_change_percent: Number((portfolioValue - 100).toFixed(2)),
-      benchmark_change_percent: Number((benchmarkValue - 100).toFixed(2))
-    })
-  }
-
-  return {
-    points,
-    start_date: points[0]?.date || null,
-    end_date: points[points.length - 1]?.date || null
-  }
-}
-
 function PerformanceChart({
   comparison,
   benchmarkName,
   performancePeriod,
-  onPeriodChange,
-  overview,
-  benchmark
+  onPeriodChange
 }) {
-  let points = comparison?.points ?? []
-  let startDate = comparison?.start_date
-  let endDate = comparison?.end_date
-  let usingPlaceholder = false
-
-  if (points.length < 2) {
-    const placeholder = buildPlaceholderPerformancePoints(performancePeriod, overview, benchmark)
-    points = placeholder.points
-    startDate = placeholder.start_date
-    endDate = placeholder.end_date
-    usingPlaceholder = points.length >= 2
-  }
+  const points = comparison?.points ?? []
+  const startDate = comparison?.start_date
+  const endDate = comparison?.end_date
 
   if (points.length < 2) {
     return (
@@ -620,7 +554,7 @@ function PerformanceChart({
           </div>
         </div>
         <p className="empty-state">
-          Not enough snapshot history for {performancePeriod} comparison yet.
+          Not enough snapshot history for {performancePeriod} comparison. Refresh market data daily to build history.
         </p>
       </section>
     )
@@ -668,10 +602,6 @@ function PerformanceChart({
           </span>
         </div>
       </div>
-
-      {usingPlaceholder ? (
-        <p className="empty-state">Showing placeholder trend until enough historical snapshots are collected.</p>
-      ) : null}
 
       <div className="performance-split">
         <div className="chart-summary">
@@ -809,10 +739,14 @@ function MiniTrendChart({ chart, compact = false }) {
 }
 
 function MarketTicker({ items }) {
+  if (!items.length) {
+    return null
+  }
+
   const repeatedItems = [...items, ...items]
 
   return (
-    <section className="market-ticker" aria-label="Nifty 50 daily movement">
+    <section className="market-ticker" aria-label="Portfolio holdings daily movement">
       <div className="ticker-track">
         {repeatedItems.map((item, index) => (
           <div key={`${item.symbol}-${index}`} className="ticker-item">
@@ -833,26 +767,31 @@ function MarketSentimentCard({ benchmark, overview }) {
   let tone = "uncertain"
   let label = "Uncertain Sentiment"
 
-  if (niftyMove > 1) {
+  if (niftyMove >= 0.35) {
     tone = "bullish"
     label = "Bullish Sentiment"
-    const momentum = Math.min((niftyMove - 1) / 1.5, 1)
+    const momentum = Math.min((niftyMove - 0.35) / 0.85, 1)
     score = 8 + Math.round(momentum * 2)
-  } else if (niftyMove > 0.3) {
+  } else if (niftyMove >= 0.05) {
     tone = "bullish"
     label = "Bullish Sentiment"
-    const momentum = Math.min((niftyMove - 0.3) / 0.7, 1)
+    const momentum = Math.min((niftyMove - 0.05) / 0.3, 1)
     score = 6 + Math.round(momentum * 2)
-  } else if (niftyMove > -0.2) {
+  } else if (niftyMove > -0.05) {
     tone = "uncertain"
     label = "Uncertain Sentiment"
-    const momentum = (niftyMove + 0.2) / 0.5
+    const momentum = (niftyMove + 0.05) / 0.1
     score = 4 + Math.round(Math.max(0, Math.min(momentum, 1)) * 2)
+  } else if (niftyMove > -0.35) {
+    tone = "bearish"
+    label = "Bearish Sentiment"
+    const severity = Math.min(Math.abs(niftyMove + 0.05) / 0.3, 1)
+    score = Math.max(2, 4 - Math.round(severity * 2))
   } else {
     tone = "bearish"
     label = "Bearish Sentiment"
-    const severity = Math.max(0, Math.min(Math.abs(niftyMove + 0.2), 1.8))
-    score = Math.max(1, 3 - Math.floor(severity / 0.8))
+    const severity = Math.max(0, Math.min(Math.abs(niftyMove + 0.35) / 0.85, 1))
+    score = Math.max(1, 2 - Math.floor(severity))
   }
 
   return (
@@ -1136,6 +1075,7 @@ function App() {
     duration: "1_MONTH",
     channel: "IN_APP"
   })
+  const accountMenuRef = useRef(null)
   const uploadInputRef = useRef(null)
   const [transactionForm, setTransactionForm] = useState({
     type: "BUY",
@@ -1182,6 +1122,23 @@ function App() {
       delete document.body.dataset.theme
     }
   }, [themeMode])
+
+  useEffect(() => {
+    if (!accountMenuOpen) {
+      return
+    }
+
+    function handleClickOutside(event) {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(event.target)) {
+        setAccountMenuOpen(false)
+      }
+    }
+
+    document.addEventListener("mousedown", handleClickOutside)
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside)
+    }
+  }, [accountMenuOpen])
 
   async function handleUpload(event) {
     const file = event.target.files?.[0]
@@ -1426,27 +1383,27 @@ function App() {
     ? `${allocationFilter.type === "asset" ? "Asset" : "Sector"}: ${allocationFilter.value}`
     : null
   const marketTickerItems = useMemo(() => {
-    if (!holdings.length) {
-      return NIFTY_50_TICKER_ITEMS
-    }
+    return holdings
+      .map((holding) => {
+        const currentValue = Number(holding.current_value ?? 0)
+        const oneDayChange = Number(holding.one_day_change ?? 0)
+        const previousValue = currentValue - oneDayChange
+        if (previousValue <= 0) {
+          return null
+        }
 
-    const holdingChangeBySymbol = new Map(
-      holdings.map((holding) => {
-        const previousValue =
-          Number(holding.current_value ?? 0) - Number(holding.one_day_change ?? 0)
-        const percentChange =
-          previousValue > 0
-            ? (Number(holding.one_day_change ?? 0) / previousValue) * 100
-            : null
+        const percentChange = (oneDayChange / previousValue) * 100
+        if (!Number.isFinite(percentChange)) {
+          return null
+        }
 
-        return [holding.symbol, percentChange]
+        return {
+          symbol: holding.symbol,
+          name: holding.company_name || holding.symbol,
+          change: percentChange
+        }
       })
-    )
-
-    return NIFTY_50_TICKER_ITEMS.map((item) => ({
-      ...item,
-      change: holdingChangeBySymbol.get(item.symbol) ?? item.change
-    }))
+      .filter(Boolean)
   }, [holdings])
 
   function jumpToHoldings() {
@@ -1509,7 +1466,7 @@ function App() {
               <path d="M17.6 6.3A7 7 0 1 0 19 13h-2a5 5 0 1 1-1-4l-2 2h6V5l-2.4 1.3Z" />
             </svg>
           </button>
-          <div className="account-wrap">
+          <div className="account-wrap" ref={accountMenuRef}>
             <button
               type="button"
               className="header-link"
@@ -1632,8 +1589,6 @@ function App() {
                 comparison={performanceComparison}
                 benchmarkName={benchmark?.name || benchmark?.symbol || "Benchmark"}
                 performancePeriod={performancePeriod}
-                overview={overview}
-                benchmark={benchmark}
                 onPeriodChange={(nextPeriod) => {
                   if (nextPeriod === performancePeriod) {
                     return

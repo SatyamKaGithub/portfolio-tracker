@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import math
 import re
 import time
@@ -30,6 +30,8 @@ from app.schemas import (
 )
 
 EPSILON = 1e-9
+TRADING_DAYS_PER_YEAR = 252
+RISK_FREE_RATE_ANNUAL = 0.05
 AMFI_NAV_URL = "https://www.amfiindia.com/spages/NAVAll.txt"
 AMFI_NAV_CACHE_TTL_SECONDS = 60 * 30
 _AMFI_NAV_CACHE: Dict[str, object] = {
@@ -51,6 +53,16 @@ def _safe_number(value, default: float = 0.0) -> float:
     if not math.isfinite(number):
         return default
     return number
+
+
+def _coalesce_text(*values: object) -> Optional[str]:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
 
 
 def _fetch_latest_close(symbol: str) -> Optional[float]:
@@ -245,7 +257,6 @@ def calculate_portfolio_value(db: Session, as_of: Optional[date] = None):
         quantity = _safe_number(h.quantity)
         avg_price = _safe_number(h.avg_price)
         invested = quantity * avg_price
-        total_invested += invested
 
         if not h.symbol or not str(h.symbol).strip():
             missing_price_symbols.append("INVALID_SYMBOL")
@@ -264,6 +275,7 @@ def calculate_portfolio_value(db: Session, as_of: Optional[date] = None):
         if price_record.date != today:
             stale_price_symbols.append(symbol)
 
+        total_invested += invested
         total_current_value += quantity * _safe_number(price_record.price)
 
     total_pnl = total_current_value - total_invested
@@ -401,8 +413,8 @@ def calculate_sharpe_ratio(db: Session):
     if volatility == 0:
         return {"message": "Volatility is zero, Sharpe ratio undefined"}
 
-    risk_free_rate_daily = 0.0
-    sharpe_ratio = (mean_return - risk_free_rate_daily) / volatility
+    risk_free_rate_daily = RISK_FREE_RATE_ANNUAL / TRADING_DAYS_PER_YEAR
+    sharpe_ratio = ((mean_return - risk_free_rate_daily) / volatility) * math.sqrt(TRADING_DAYS_PER_YEAR)
 
     return {
         "sharpe_ratio": round(sharpe_ratio, 4),
@@ -588,7 +600,11 @@ def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
         "observations": len(aligned_portfolio),
     }
 
-def calculate_alpha(db: Session, benchmark_symbol: str = "^NSEI", risk_free_rate_annual: float = 0.05):
+def calculate_alpha(
+    db: Session,
+    benchmark_symbol: str = "^NSEI",
+    risk_free_rate_annual: float = RISK_FREE_RATE_ANNUAL,
+):
     aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
 
     if aligned_portfolio is None:
@@ -604,7 +620,7 @@ def calculate_alpha(db: Session, benchmark_symbol: str = "^NSEI", risk_free_rate
     covariance = float(aligned_portfolio.cov(aligned_benchmark))
     beta = covariance / variance
 
-    trading_days = 252
+    trading_days = TRADING_DAYS_PER_YEAR
     risk_free_daily = risk_free_rate_annual / trading_days
 
     expected_return = risk_free_daily + beta * (benchmark_mean - risk_free_daily)
@@ -639,7 +655,7 @@ def calculate_information_ratio(db: Session, benchmark_symbol: str = "^NSEI"):
     if not math.isfinite(information_ratio):
         return {"message": "Could not compute information ratio"}
 
-    trading_days = 252
+    trading_days = TRADING_DAYS_PER_YEAR
     return {
         "benchmark": benchmark_symbol,
         "information_ratio_daily": round(information_ratio, 6),
@@ -664,7 +680,7 @@ def calculate_tracking_error(db: Session, benchmark_symbol: str = "^NSEI"):
     if not math.isfinite(tracking_error_daily):
         return {"message": "Could not compute tracking error"}
 
-    trading_days = 252
+    trading_days = TRADING_DAYS_PER_YEAR
     return {
         "benchmark": benchmark_symbol,
         "tracking_error_daily": round(tracking_error_daily, 6),
@@ -1113,10 +1129,10 @@ def refresh_imported_holdings_market_data(db: Session):
         current_price = _first_finite(snapshot.get("current_price"), holding.current_price)
         prev_close = _first_finite(snapshot.get("prev_close"), holding.prev_close)
 
-        holding.exchange_symbol = str(snapshot.get("exchange_symbol") or holding.exchange_symbol or "")
-        holding.company_name = str(snapshot.get("company_name") or holding.company_name or "")
-        holding.sector = str(snapshot.get("sector") or holding.sector or "")
-        holding.geography = str(snapshot.get("geography") or holding.geography or "India")
+        holding.exchange_symbol = _coalesce_text(snapshot.get("exchange_symbol"), holding.exchange_symbol)
+        holding.company_name = _coalesce_text(snapshot.get("company_name"), holding.company_name)
+        holding.sector = _coalesce_text(snapshot.get("sector"), holding.sector)
+        holding.geography = _coalesce_text(snapshot.get("geography"), holding.geography, "India")
         holding.current_price = current_price
         holding.prev_close = prev_close
         holding.current_value = quantity * current_price if current_price is not None else holding.current_value
@@ -1159,10 +1175,10 @@ def _refresh_single_imported_holding(holding: ImportedHolding) -> None:
     )
 
     if snapshot:
-        holding.exchange_symbol = str(snapshot.get("exchange_symbol") or holding.exchange_symbol or "")
-        holding.company_name = str(snapshot.get("company_name") or holding.company_name or "")
-        holding.sector = str(snapshot.get("sector") or holding.sector or "")
-        holding.geography = str(snapshot.get("geography") or holding.geography or "India")
+        holding.exchange_symbol = _coalesce_text(snapshot.get("exchange_symbol"), holding.exchange_symbol)
+        holding.company_name = _coalesce_text(snapshot.get("company_name"), holding.company_name)
+        holding.sector = _coalesce_text(snapshot.get("sector"), holding.sector)
+        holding.geography = _coalesce_text(snapshot.get("geography"), holding.geography, "India")
         holding.pe_ratio = _first_finite(snapshot.get("pe_ratio"), holding.pe_ratio)
 
         quote_type = str(snapshot.get("quote_type") or "").strip().upper()
@@ -1225,7 +1241,8 @@ def apply_imported_holding_transaction(db: Session, txn: ImportedHoldingTransact
             )
 
         remaining_qty = existing_qty - quantity
-        remaining_invested = max(existing_invested - (quantity * price), 0.0)
+        cost_of_sold = quantity * existing_avg
+        remaining_invested = max(existing_invested - cost_of_sold, 0.0)
 
         if remaining_qty <= EPSILON:
             db.delete(holding)
@@ -1330,16 +1347,47 @@ def _fetch_benchmark_summary(symbol: str = "^NSEI") -> Dict[str, object]:
         }
 
     closes = history["Close"].dropna() if not history.empty and "Close" in history else []
-    price = float(closes.iloc[-1]) if len(closes) else None
-    prev_close = float(closes.iloc[-2]) if len(closes) > 1 else price
-    change_percent = None
-    if price is not None and prev_close not in (None, 0):
-        change_percent = ((price - prev_close) / prev_close) * 100
+    daily_closes = pd.to_numeric(closes, errors="coerce").dropna() if len(closes) else pd.Series(dtype="float64")
+    daily_dates = [pd.to_datetime(index).date() for index in daily_closes.index]
+
+    try:
+        fast_info = ticker.fast_info or {}
+    except Exception:
+        fast_info = {}
 
     try:
         info = ticker.info or {}
     except Exception:
         info = {}
+
+    last_daily_close = float(daily_closes.iloc[-1]) if len(daily_closes) else None
+    price = _first_finite(
+        fast_info.get("regular_market_price"),
+        fast_info.get("last_price"),
+        info.get("regularMarketPrice"),
+        info.get("currentPrice"),
+        last_daily_close,
+    )
+
+    prev_close = _first_finite(
+        fast_info.get("regular_market_previous_close"),
+        fast_info.get("previous_close"),
+        info.get("regularMarketPreviousClose"),
+        info.get("previousClose"),
+    )
+    if (prev_close is None or prev_close <= 0) and len(daily_closes) >= 1:
+        today_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).date()
+        last_daily_date = daily_dates[-1]
+        if len(daily_closes) >= 2:
+            prev_close = float(daily_closes.iloc[-2]) if last_daily_date >= today_ist else float(daily_closes.iloc[-1])
+        else:
+            prev_close = float(daily_closes.iloc[-1])
+
+    if prev_close is not None and prev_close <= 0:
+        prev_close = None
+    change_percent = None
+    if price is not None and prev_close not in (None, 0):
+        change_percent = ((price - prev_close) / prev_close) * 100
 
     pe_ratio = _first_finite(info.get("trailingPE"), info.get("forwardPE")) if info else None
 
@@ -1350,6 +1398,60 @@ def _fetch_benchmark_summary(symbol: str = "^NSEI") -> Dict[str, object]:
         "prev_close": round(prev_close, 2) if prev_close is not None else None,
         "one_day_change_percent": round(change_percent, 2) if change_percent is not None else None,
         "pe_ratio": round(pe_ratio, 2) if pe_ratio is not None else None,
+    }
+
+
+def _fetch_bse_sensex_snapshot() -> Optional[Dict[str, float]]:
+    try:
+        request = urlrequest.Request(
+            "https://m.bseindia.com/IndicesView.aspx",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://m.bseindia.com/",
+            },
+        )
+        with urlrequest.urlopen(request, timeout=6) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    match = re.search(
+        r"BSE SENSEX</a></td><td[^>]*>\s*([0-9,]+(?:\.[0-9]+)?)\s*</td>"
+        r"<td[^>]*>\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*</td>"
+        r"<td[^>]*>\s*([+-]?[0-9,]+(?:\.[0-9]+)?)\s*</td>",
+        html,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    try:
+        current_level = float(match.group(1).replace(",", ""))
+        points_change = float(match.group(2).replace(",", ""))
+        change_percent = float(match.group(3).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+    if not math.isfinite(current_level) or not math.isfinite(points_change):
+        return None
+
+    prev_close = current_level - points_change
+    if not math.isfinite(prev_close) or prev_close <= 0:
+        return None
+
+    if not math.isfinite(change_percent):
+        change_percent = ((points_change / prev_close) * 100)
+
+    return {
+        "current_level": current_level,
+        "prev_close": prev_close,
+        "points_change": points_change,
+        "change_percent": change_percent,
     }
 
 
@@ -1382,20 +1484,10 @@ def _upsert_imported_holdings_snapshot(
     if not holdings and not allow_empty:
         return False
 
-    portfolio_data = (
-        _imported_portfolio_totals(holdings)
-        if holdings
-        else {
-            "total_current_value": 0.0,
-            "total_invested": 0.0,
-            "total_pnl": 0.0,
-        }
-    )
-
-    return _upsert_portfolio_snapshot(
+    return _upsert_imported_portfolio_snapshot(
         db,
         snapshot_date or date.today(),
-        portfolio_data,
+        allow_empty=allow_empty,
         overwrite=overwrite,
     )
 
@@ -1485,7 +1577,11 @@ def _ensure_imported_snapshot_history(db: Session) -> None:
 def _fetch_benchmark_mini_chart(symbol: str, fallback_name: str) -> Dict[str, object]:
     try:
         ticker = yf.Ticker(symbol)
-        intraday_history = ticker.history(period="2d", interval="15m", auto_adjust=False)
+        intraday_history = ticker.history(period="1d", interval="1m", auto_adjust=False)
+        if intraday_history.empty or "Close" not in intraday_history:
+            intraday_history = ticker.history(period="1d", interval="5m", auto_adjust=False)
+        if intraday_history.empty or "Close" not in intraday_history:
+            intraday_history = ticker.history(period="2d", interval="15m", auto_adjust=False)
         daily_history = ticker.history(period="5d", auto_adjust=False)
     except Exception:
         return {
@@ -1545,23 +1641,82 @@ def _fetch_benchmark_mini_chart(symbol: str, fallback_name: str) -> Dict[str, ob
         else pd.Series(dtype="float64")
     )
     daily_dates = [pd.to_datetime(index).date() for index in daily_closes.index]
-    prev_close = None
-    if len(daily_closes) >= 2 and daily_dates[-1] == latest_session_date:
-        prev_close = float(daily_closes.iloc[-2])
-    elif len(daily_closes) >= 1 and daily_dates[-1] < latest_session_date:
-        prev_close = float(daily_closes.iloc[-1])
-    elif len(closes) >= 1:
-        prev_close = float(closes.iloc[0])
 
-    summary_level = float(daily_closes.iloc[-1]) if len(daily_closes) >= 1 else float(closes.iloc[-1])
     intraday_last = float(closes.iloc[-1])
-    current_level = summary_level
-    points_change = current_level - prev_close if prev_close else None
-    change_percent = ((current_level - prev_close) / prev_close) * 100 if prev_close else None
-    trend = "positive" if (points_change or 0) >= 0 else "negative"
+    try:
+        fast_info = ticker.fast_info or {}
+    except Exception:
+        fast_info = {}
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}
+
+    market_price = _first_finite(
+        fast_info.get("regular_market_price"),
+        fast_info.get("last_price"),
+        info.get("regularMarketPrice"),
+        info.get("currentPrice"),
+    )
+    market_prev_close = _first_finite(
+        fast_info.get("regular_market_previous_close"),
+        fast_info.get("previous_close"),
+        info.get("regularMarketPreviousClose"),
+        info.get("previousClose"),
+    )
+    market_change = _first_finite(
+        info.get("regularMarketChange"),
+        info.get("regularMarketChangePoint"),
+    )
+    market_change_percent = _first_finite(
+        info.get("regularMarketChangePercent"),
+    )
+
+    bse_snapshot = _fetch_bse_sensex_snapshot() if symbol == "^BSESN" else None
+    if bse_snapshot:
+        current_level = bse_snapshot["current_level"]
+        prev_close = bse_snapshot["prev_close"]
+        points_change = bse_snapshot["points_change"]
+        change_percent = bse_snapshot["change_percent"]
+    elif (
+        market_price is not None
+        and market_change is not None
+        and market_price > 0
+    ):
+        current_level = market_price
+        points_change = market_change
+        prev_close = current_level - points_change
+        change_percent = (
+            market_change_percent
+            if market_change_percent is not None
+            else (((current_level - prev_close) / prev_close) * 100 if prev_close not in (None, 0) else None)
+        )
+    else:
+        current_level = _first_finite(market_price, intraday_last)
+        if current_level is None or current_level <= 0:
+            current_level = intraday_last
+
+        prev_close = None
+        if market_prev_close is not None and market_prev_close > 0:
+            prev_close = market_prev_close
+        elif len(daily_closes) >= 2 and daily_dates[-1] == latest_session_date:
+            prev_close = float(daily_closes.iloc[-2])
+        elif len(daily_closes) >= 1:
+            prev_close = float(daily_closes.iloc[-1])
+        elif len(closes) >= 1:
+            prev_close = float(closes.iloc[0])
+
+        points_change = current_level - prev_close if prev_close is not None else None
+        change_percent = (
+            ((current_level - prev_close) / prev_close) * 100
+            if prev_close not in (None, 0)
+            else None
+        )
 
     adjustment = current_level - intraday_last
     adjusted_closes = closes + adjustment
+
+    trend = None if points_change is None else ("positive" if points_change >= 0 else "negative")
 
     points = [
         {
@@ -1575,7 +1730,7 @@ def _fetch_benchmark_mini_chart(symbol: str, fallback_name: str) -> Dict[str, ob
         "symbol": symbol,
         "name": fallback_name,
         "current_level": round(current_level, 2),
-        "prev_close": round(prev_close, 2) if prev_close else None,
+        "prev_close": round(prev_close, 2) if prev_close is not None else None,
         "points_change": round(points_change, 2) if points_change is not None else None,
         "change_percent": round(change_percent, 2) if change_percent is not None else None,
         "trend": trend,
@@ -1593,7 +1748,11 @@ def _calculate_imported_risk_metrics(db: Session, benchmark_symbol: str = "^NSEI
         variance = sum((r - mean_return) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
         volatility = math.sqrt(variance)
         if volatility != 0:
-            sharpe_ratio = round(mean_return / volatility, 4)
+            risk_free_daily = RISK_FREE_RATE_ANNUAL / TRADING_DAYS_PER_YEAR
+            sharpe_ratio = round(
+                ((mean_return - risk_free_daily) / volatility) * math.sqrt(TRADING_DAYS_PER_YEAR),
+                4,
+            )
 
     aligned_portfolio, aligned_benchmark = _get_aligned_return_series_for_snapshots(
         snapshots,
@@ -1614,8 +1773,8 @@ def _calculate_imported_risk_metrics(db: Session, benchmark_symbol: str = "^NSEI
 
                     portfolio_mean = float(aligned_portfolio.mean())
                     benchmark_mean = float(aligned_benchmark.mean())
-                    trading_days = 252
-                    risk_free_daily = 0.05 / trading_days
+                    trading_days = TRADING_DAYS_PER_YEAR
+                    risk_free_daily = RISK_FREE_RATE_ANNUAL / trading_days
                     expected_return = risk_free_daily + beta_value * (benchmark_mean - risk_free_daily)
                     alpha_daily = portfolio_mean - expected_return
                     alpha_annualized_percent = round(alpha_daily * trading_days * 100, 2)
@@ -1978,7 +2137,19 @@ def get_imported_portfolio_dashboard(
     )
 
     latest_import = db.query(ImportedHolding).order_by(ImportedHolding.imported_at.desc()).first()
+    nifty_chart = _fetch_benchmark_mini_chart("^NSEI", "Nifty 50")
+    sensex_chart = _fetch_benchmark_mini_chart("^BSESN", "Sensex")
+
     benchmark = _fetch_benchmark_summary("^NSEI")
+    if nifty_chart.get("current_level") is not None:
+        benchmark["price"] = nifty_chart.get("current_level")
+    if nifty_chart.get("prev_close") is not None:
+        benchmark["prev_close"] = nifty_chart.get("prev_close")
+    if nifty_chart.get("change_percent") is not None:
+        benchmark["one_day_change_percent"] = nifty_chart.get("change_percent")
+    if nifty_chart.get("name"):
+        benchmark["name"] = nifty_chart.get("name")
+
     benchmark_pe = benchmark.get("pe_ratio")
     risk_metrics = _calculate_imported_risk_metrics(db, "^NSEI")
     recurring_sips = db.query(RecurringSip).order_by(RecurringSip.next_run_date.asc(), RecurringSip.id.asc()).all()
@@ -2000,8 +2171,8 @@ def get_imported_portfolio_dashboard(
         "sector_allocation": _bucketize(rows, "sector"),
         "benchmark": benchmark,
         "benchmark_charts": [
-            _fetch_benchmark_mini_chart("^NSEI", "Nifty 50"),
-            _fetch_benchmark_mini_chart("^BSESN", "Sensex"),
+            nifty_chart,
+            sensex_chart,
         ],
         "risk_metrics": risk_metrics,
         "performance_comparison": _build_normalized_performance_comparison(
