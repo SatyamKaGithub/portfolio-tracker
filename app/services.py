@@ -1,6 +1,11 @@
+import base64
 from datetime import date, datetime, timedelta, timezone
+import hashlib
+import hmac
 import math
+import os
 import re
+import secrets
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
@@ -18,6 +23,9 @@ from app.models import (
     ImportedPortfolioSnapshot,
     ImportedHoldingTransaction,
     RecurringSip,
+    SipJobRun,
+    User,
+    UserSession,
     PortfolioSnapshot,
     Price,
     Transaction,
@@ -25,7 +33,9 @@ from app.models import (
 from app.schemas import (
     HoldingsImportPayload,
     ImportedHoldingTransactionCreate,
+    LoginPayload,
     RecurringSipCreate,
+    SignupPayload,
     TransactionCreate,
 )
 
@@ -39,6 +49,67 @@ _AMFI_NAV_CACHE: Dict[str, object] = {
     "by_isin": {},
     "rows": [],
 }
+NIFTY50_CACHE_TTL_SECONDS = 60 * 5
+_NIFTY50_CACHE: Dict[str, object] = {
+    "loaded_at": 0.0,
+    "rows": [],
+}
+_NIFTY50_SYMBOLS: List[Tuple[str, str]] = [
+    ("ADANIENT.NS", "Adani Ent."),
+    ("ADANIPORTS.NS", "Adani Ports"),
+    ("APOLLOHOSP.NS", "Apollo Hosp"),
+    ("ASIANPAINT.NS", "Asian Paints"),
+    ("AXISBANK.NS", "Axis Bank"),
+    ("BAJAJ-AUTO.NS", "Bajaj Auto"),
+    ("BAJFINANCE.NS", "Bajaj Finance"),
+    ("BAJAJFINSV.NS", "Bajaj Finserv"),
+    ("BEL.NS", "BEL"),
+    ("BHARTIARTL.NS", "Bharti Airtel"),
+    ("BPCL.NS", "BPCL"),
+    ("BRITANNIA.NS", "Britannia"),
+    ("CIPLA.NS", "Cipla"),
+    ("COALINDIA.NS", "Coal India"),
+    ("DRREDDY.NS", "Dr Reddy"),
+    ("EICHERMOT.NS", "Eicher Motors"),
+    ("ETERNAL.NS", "Eternal"),
+    ("GRASIM.NS", "Grasim"),
+    ("HCLTECH.NS", "HCL Tech"),
+    ("HDFCBANK.NS", "HDFC Bank"),
+    ("HDFCLIFE.NS", "HDFC Life"),
+    ("HEROMOTOCO.NS", "Hero Moto"),
+    ("HINDALCO.NS", "Hindalco"),
+    ("HINDUNILVR.NS", "HUL"),
+    ("ICICIBANK.NS", "ICICI Bank"),
+    ("INDUSINDBK.NS", "IndusInd"),
+    ("INFY.NS", "Infosys"),
+    ("ITC.NS", "ITC"),
+    ("JIOFIN.NS", "Jio Fin"),
+    ("JSWSTEEL.NS", "JSW Steel"),
+    ("KOTAKBANK.NS", "Kotak Bank"),
+    ("LT.NS", "L&T"),
+    ("M&M.NS", "M&M"),
+    ("MARUTI.NS", "Maruti"),
+    ("NESTLEIND.NS", "Nestle"),
+    ("NTPC.NS", "NTPC"),
+    ("ONGC.NS", "ONGC"),
+    ("POWERGRID.NS", "PowerGrid"),
+    ("RELIANCE.NS", "Reliance"),
+    ("SBILIFE.NS", "SBI Life"),
+    ("SBIN.NS", "SBI"),
+    ("SHRIRAMFIN.NS", "Shriram Fin"),
+    ("SUNPHARMA.NS", "Sun Pharma"),
+    ("TATACONSUM.NS", "Tata Consumer"),
+    ("TATAMOTORS.NS", "Tata Motors"),
+    ("TATASTEEL.NS", "Tata Steel"),
+    ("TCS.NS", "TCS"),
+    ("TECHM.NS", "Tech Mahindra"),
+    ("TITAN.NS", "Titan"),
+    ("TRENT.NS", "Trent"),
+    ("ULTRACEMCO.NS", "UltraTech"),
+    ("WIPRO.NS", "Wipro"),
+]
+PASSWORD_HASH_ITERATIONS = 100_000
+SESSION_EXPIRY_DAYS = 14
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -83,6 +154,34 @@ def _fetch_latest_close(symbol: str) -> Optional[float]:
         return None
 
     return latest
+
+
+def _hash_password(raw_password: str, salt: Optional[bytes] = None) -> str:
+    chosen_salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        raw_password.encode("utf-8"),
+        chosen_salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return f"{base64.b64encode(chosen_salt).decode('utf-8')}${base64.b64encode(digest).decode('utf-8')}"
+
+
+def _verify_password(raw_password: str, stored_hash: str) -> bool:
+    try:
+        salt_text, hash_text = stored_hash.split("$", 1)
+        salt = base64.b64decode(salt_text.encode("utf-8"))
+        expected = base64.b64decode(hash_text.encode("utf-8"))
+    except Exception:
+        return False
+
+    actual = hashlib.pbkdf2_hmac(
+        "sha256",
+        raw_password.encode("utf-8"),
+        salt,
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return hmac.compare_digest(expected, actual)
 
 
 def _upsert_portfolio_snapshot(
@@ -735,6 +834,9 @@ def create_transactions(db: Session, txns: List[TransactionCreate]):
             transactions.append(transaction)
             db.add(transaction)
             _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type)
+            # Session autoflush is disabled globally, so explicit flush is required
+            # for subsequent operations in the same batch to observe pending writes.
+            db.flush()
 
         db.commit()
     except Exception:
@@ -1815,6 +1917,292 @@ def _apply_imported_buy(
             date=txn_date,
         )
     )
+
+
+def create_user_account(db: Session, payload: SignupPayload) -> Dict[str, object]:
+    username = payload.username.strip()
+    email = payload.email.strip().lower()
+
+    existing_user = db.query(User).filter(
+        (func.lower(User.username) == username.lower())
+        | (func.lower(User.email) == email.lower())
+    ).first()
+    if existing_user:
+        raise ValueError("An account with this username or email already exists")
+
+    user = User(
+        username=username,
+        email=email,
+        password_hash=_hash_password(payload.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+
+def login_user_account(db: Session, payload: LoginPayload) -> Dict[str, object]:
+    login_value = payload.login.strip()
+    user = db.query(User).filter(
+        (func.lower(User.username) == login_value.lower())
+        | (func.lower(User.email) == login_value.lower())
+    ).first()
+
+    if not user or not _verify_password(payload.password, user.password_hash):
+        raise ValueError("Invalid credentials")
+
+    token = secrets.token_urlsafe(36)
+    now = datetime.utcnow()
+    session = UserSession(
+        user_id=user.id,
+        token=token,
+        created_at=now,
+        expires_at=now + timedelta(days=SESSION_EXPIRY_DAYS),
+    )
+    db.add(session)
+    db.commit()
+
+    return {
+        "token": token,
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+        },
+    }
+
+
+def get_user_from_token(db: Session, token: str) -> Optional[Dict[str, object]]:
+    clean_token = (token or "").strip()
+    if not clean_token:
+        return None
+
+    now = datetime.utcnow()
+    session = db.query(UserSession).filter(
+        UserSession.token == clean_token,
+        UserSession.expires_at > now,
+    ).first()
+    if not session:
+        return None
+
+    user = db.query(User).filter(User.id == session.user_id).first()
+    if not user:
+        return None
+
+    return {
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "session_expires_at": session.expires_at.isoformat() if session.expires_at else None,
+    }
+
+
+def logout_user_session(db: Session, token: str) -> bool:
+    clean_token = (token or "").strip()
+    if not clean_token:
+        return False
+
+    deleted = db.query(UserSession).filter(UserSession.token == clean_token).delete()
+    db.commit()
+    return bool(deleted)
+
+
+def _load_nifty50_ticker_rows() -> List[Dict[str, object]]:
+    symbols = [symbol for symbol, _ in _NIFTY50_SYMBOLS]
+    if not symbols:
+        return []
+
+    try:
+        frame = yf.download(
+            tickers=" ".join(symbols),
+            period="5d",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception:
+        return []
+
+    rows: List[Dict[str, object]] = []
+    if frame is None or frame.empty:
+        return rows
+
+    for symbol, name in _NIFTY50_SYMBOLS:
+        close_series = None
+        if isinstance(frame.columns, pd.MultiIndex):
+            try:
+                close_series = frame[(symbol, "Close")]
+            except Exception:
+                close_series = None
+        elif "Close" in frame.columns and len(_NIFTY50_SYMBOLS) == 1:
+            close_series = frame["Close"]
+
+        if close_series is None:
+            continue
+
+        closes = pd.to_numeric(close_series, errors="coerce").dropna()
+        if len(closes) < 2:
+            continue
+
+        prev_close = float(closes.iloc[-2])
+        latest_close = float(closes.iloc[-1])
+        if prev_close <= 0 or not math.isfinite(prev_close) or not math.isfinite(latest_close):
+            continue
+
+        change_percent = ((latest_close - prev_close) / prev_close) * 100
+        rows.append(
+            {
+                "symbol": symbol.replace(".NS", ""),
+                "name": name,
+                "price": round(latest_close, 2),
+                "change_percent": round(change_percent, 2),
+            }
+        )
+
+    return rows
+
+
+def get_nifty50_ticker_snapshot() -> Dict[str, object]:
+    now = time.time()
+    loaded_at = float(_NIFTY50_CACHE.get("loaded_at") or 0.0)
+    cached_rows = _NIFTY50_CACHE.get("rows") or []
+
+    if now - loaded_at < NIFTY50_CACHE_TTL_SECONDS and cached_rows:
+        return {
+            "as_of": datetime.fromtimestamp(loaded_at, tz=timezone.utc).isoformat(),
+            "rows": cached_rows,
+        }
+
+    rows = _load_nifty50_ticker_rows()
+    if rows:
+        _NIFTY50_CACHE["loaded_at"] = now
+        _NIFTY50_CACHE["rows"] = rows
+        return {
+            "as_of": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            "rows": rows,
+        }
+
+    return {
+        "as_of": datetime.fromtimestamp(loaded_at, tz=timezone.utc).isoformat() if loaded_at else None,
+        "rows": cached_rows,
+    }
+
+
+def run_sip_job(
+    db: Session,
+    trigger: str = "SCHEDULED",
+    force: bool = False,
+) -> Dict[str, object]:
+    run_date = date.today()
+    now = datetime.utcnow()
+    normalized_trigger = (trigger or "SCHEDULED").strip().upper()
+
+    run_log = db.query(SipJobRun).filter(SipJobRun.run_date == run_date).first()
+    if (
+        run_log
+        and run_log.status == "SUCCESS"
+        and not force
+    ):
+        return {
+            "status": "skipped",
+            "trigger": normalized_trigger,
+            "run_date": run_date.isoformat(),
+            "processed_sips": int(run_log.processed_sips or 0),
+            "reason": "SIP job already completed for today",
+            "last_run_at": run_log.ended_at.isoformat() if run_log.ended_at else None,
+        }
+
+    if run_log is None:
+        run_log = SipJobRun(run_date=run_date)
+        db.add(run_log)
+
+    run_log.trigger = normalized_trigger
+    run_log.status = "RUNNING"
+    run_log.processed_sips = 0
+    run_log.skip_reason = None
+    run_log.error_message = None
+    run_log.started_at = now
+    run_log.ended_at = None
+    db.commit()
+
+    try:
+        result = process_due_sips(db)
+        processed = int(result.get("processed_sips") or 0)
+        run_log.status = "SUCCESS"
+        run_log.processed_sips = processed
+        run_log.ended_at = datetime.utcnow()
+        db.commit()
+        return {
+            "status": "success",
+            "trigger": normalized_trigger,
+            "run_date": run_date.isoformat(),
+            "processed_sips": processed,
+            "reason": None,
+            "last_run_at": run_log.ended_at.isoformat() if run_log.ended_at else None,
+        }
+    except Exception as exc:
+        db.rollback()
+        run_log = db.query(SipJobRun).filter(SipJobRun.run_date == run_date).first()
+        if run_log is None:
+            run_log = SipJobRun(run_date=run_date)
+            db.add(run_log)
+        run_log.trigger = normalized_trigger
+        run_log.status = "FAILED"
+        run_log.error_message = str(exc)
+        run_log.ended_at = datetime.utcnow()
+        db.commit()
+        raise
+
+
+def get_sip_job_status(db: Session) -> Dict[str, object]:
+    logs = db.query(SipJobRun).order_by(SipJobRun.run_date.desc()).all()
+    last_run = logs[0] if logs else None
+    today = date.today()
+    today_run = next((log for log in logs if log.run_date == today), None)
+
+    successful_runs = [log for log in logs if log.status == "SUCCESS"]
+    failed_runs = [log for log in logs if log.status == "FAILED"]
+
+    return {
+        "last_run": (
+            {
+                "run_date": last_run.run_date.isoformat(),
+                "status": last_run.status,
+                "trigger": last_run.trigger,
+                "processed_sips": int(last_run.processed_sips or 0),
+                "started_at": last_run.started_at.isoformat() if last_run.started_at else None,
+                "ended_at": last_run.ended_at.isoformat() if last_run.ended_at else None,
+                "error_message": last_run.error_message,
+            }
+            if last_run
+            else None
+        ),
+        "today": (
+            {
+                "run_date": today_run.run_date.isoformat(),
+                "status": today_run.status,
+                "processed_sips": int(today_run.processed_sips or 0),
+                "ended_at": today_run.ended_at.isoformat() if today_run.ended_at else None,
+            }
+            if today_run
+            else None
+        ),
+        "totals": {
+            "runs": len(logs),
+            "successful_runs": len(successful_runs),
+            "failed_runs": len(failed_runs),
+            "processed_sips_total": int(sum(log.processed_sips or 0 for log in successful_runs)),
+        },
+    }
 
 
 def process_due_sips(db: Session) -> Dict[str, int]:

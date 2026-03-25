@@ -398,6 +398,106 @@
   background: linear-gradient(135deg, rgba(118, 183, 178, 0.12), rgba(18, 27, 31, 0.96));
 }
 
+.sip-job-card {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.sip-job-card span {
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.4;
+}
+
+.sip-job-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.sip-movers-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.sip-movers-title {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.movers-card {
+  align-content: start;
+}
+
+.calendar-card,
+.rebalance-card {
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+
+.mover-positive {
+  color: var(--positive);
+}
+
+.mover-negative {
+  color: var(--negative);
+}
+
+.sip-movers-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 5px;
+}
+
+.sip-movers-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.82rem;
+}
+
+.sip-movers-list b {
+  font-weight: 700;
+}
+
+.insight-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 7px;
+}
+
+.insight-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.84rem;
+}
+
+.insight-list li small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.rebalance-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 6px;
+}
+
 .panel {
   padding: 16px 18px;
 }
@@ -1272,5 +1372,13 @@ th {
   .pie-svg {
     width: 200px;
     height: 200px;
+  }
+
+  .sip-movers-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .rebalance-grid {
+    grid-template-columns: 1fr;
   }
 }

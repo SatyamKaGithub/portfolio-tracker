@@ -105,3 +105,43 @@ class RecurringSip(Base):
     day_of_month = Column(Integer)
     active = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class SipJobRun(Base):
+    __tablename__ = "sip_job_runs"
+    __table_args__ = (
+        UniqueConstraint("run_date", name="uq_sip_job_runs_run_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_date = Column(Date, default=date.today, index=True)
+    trigger = Column(String, default="SCHEDULED")
+    status = Column(String, default="PENDING")  # PENDING/RUNNING/SUCCESS/FAILED/SKIPPED
+    processed_sips = Column(Integer, default=0)
+    skip_reason = Column(String, nullable=True)
+    error_message = Column(String, nullable=True)
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    ended_at = Column(DateTime, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class UserSession(Base):
+    __tablename__ = "user_sessions"
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_user_sessions_token"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    token = Column(String, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    expires_at = Column(DateTime, index=True)

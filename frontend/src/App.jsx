@@ -2,9 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   applyImportedHoldingTransaction,
   addRecurringSip,
+  clearStoredSession,
+  getCurrentUser,
   getImportedDashboard,
+  getNifty50Snapshot,
+  login,
   importHoldingsWorkbook,
-  refreshImportedHoldings
+  logout,
+  refreshImportedHoldings,
+  getSipJobStatus,
+  runSipJob,
+  signup
 } from "./services/api"
 import "./App.css"
 
@@ -137,6 +145,21 @@ function formatDateTime(value) {
   return new Intl.DateTimeFormat("en-IN", {
     dateStyle: "medium",
     timeStyle: "short"
+  }).format(date)
+}
+
+function formatDate(value) {
+  if (!value) {
+    return "N/A"
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return value
+  }
+
+  return new Intl.DateTimeFormat("en-IN", {
+    dateStyle: "medium"
   }).format(date)
 }
 
@@ -746,7 +769,7 @@ function MarketTicker({ items }) {
   const repeatedItems = [...items, ...items]
 
   return (
-    <section className="market-ticker" aria-label="Portfolio holdings daily movement">
+    <section className="market-ticker" aria-label="Nifty 50 daily movement">
       <div className="ticker-track">
         {repeatedItems.map((item, index) => (
           <div key={`${item.symbol}-${index}`} className="ticker-item">
@@ -923,6 +946,116 @@ function PriceAlertModal({ open, onClose, form, onChange }) {
   )
 }
 
+function AuthModal({
+  open,
+  mode,
+  form,
+  onChange,
+  onClose,
+  onSwitchMode,
+  onSubmit,
+  submitting
+}) {
+  if (!open) {
+    return null
+  }
+
+  const isLogin = mode === "login"
+
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <div
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label={isLogin ? "Login" : "Signup"}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="panel-heading modal-heading">
+          <div>
+            <p className="panel-kicker">{isLogin ? "Welcome back" : "Create account"}</p>
+            <h3>{isLogin ? "Login" : "Signup"}</h3>
+          </div>
+          <button className="ghost-button" type="button" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        <form className="transaction-form" onSubmit={onSubmit}>
+          {isLogin ? (
+            <label>
+              <span>Username or email</span>
+              <input
+                name="login"
+                type="text"
+                value={form.login}
+                onChange={onChange}
+                required
+              />
+            </label>
+          ) : (
+            <>
+              <label>
+                <span>Username</span>
+                <input
+                  name="username"
+                  type="text"
+                  value={form.username}
+                  onChange={onChange}
+                  required
+                />
+              </label>
+              <label>
+                <span>Email</span>
+                <input
+                  name="email"
+                  type="email"
+                  value={form.email}
+                  onChange={onChange}
+                  required
+                />
+              </label>
+            </>
+          )}
+          <label>
+            <span>Password</span>
+            <input
+              name="password"
+              type="password"
+              value={form.password}
+              onChange={onChange}
+              required
+              minLength={8}
+            />
+          </label>
+          {!isLogin ? (
+            <label>
+              <span>Confirm password</span>
+              <input
+                name="confirmPassword"
+                type="password"
+                value={form.confirmPassword}
+                onChange={onChange}
+                required
+                minLength={8}
+              />
+            </label>
+          ) : null}
+
+          <div className="modal-actions">
+            <button className="ghost-button" type="button" onClick={onSwitchMode}>
+              {isLogin ? "Need an account? Signup" : "Have an account? Login"}
+            </button>
+            <button className="secondary-button" type="submit" disabled={submitting}>
+              {submitting ? "Please wait..." : isLogin ? "Login" : "Signup"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 function TransactionModal({
   holding,
   form,
@@ -1058,12 +1191,26 @@ function App() {
   const [refreshing, setRefreshing] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [submittingTransaction, setSubmittingTransaction] = useState(false)
+  const [submittingAuth, setSubmittingAuth] = useState(false)
+  const [runningSipJob, setRunningSipJob] = useState(false)
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
+  const [sipJobStatus, setSipJobStatus] = useState(null)
+  const [niftyTickerRows, setNiftyTickerRows] = useState([])
   const [allocationFilter, setAllocationFilter] = useState(null)
   const [activeActionSymbol, setActiveActionSymbol] = useState(null)
   const [transactionHolding, setTransactionHolding] = useState(null)
   const [sipHolding, setSipHolding] = useState(null)
+  const [authModalOpen, setAuthModalOpen] = useState(false)
+  const [authMode, setAuthMode] = useState("login")
+  const [currentUser, setCurrentUser] = useState(null)
+  const [authForm, setAuthForm] = useState({
+    username: "",
+    email: "",
+    login: "",
+    password: "",
+    confirmPassword: ""
+  })
   const [searchTerm, setSearchTerm] = useState("")
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const [themeMode, setThemeMode] = useState("dark")
@@ -1088,6 +1235,36 @@ function App() {
     start_date: todayInputValue()
   })
 
+  const loadNiftyTicker = useCallback(async () => {
+    try {
+      const data = await getNifty50Snapshot()
+      setNiftyTickerRows(Array.isArray(data?.rows) ? data.rows : [])
+    } catch {
+      setNiftyTickerRows([])
+    }
+  }, [])
+
+  const bootstrapSession = useCallback(async () => {
+    try {
+      const user = await getCurrentUser()
+      setCurrentUser(user)
+    } catch {
+      clearStoredSession()
+      setCurrentUser(null)
+    }
+  }, [])
+
+  const loadSipJobOperationsStatus = useCallback(async (silent = true) => {
+    try {
+      const status = await getSipJobStatus()
+      setSipJobStatus(status)
+    } catch (err) {
+      if (!silent) {
+        setError(err instanceof Error ? err.message : "Failed to load SIP job status")
+      }
+    }
+  }, [])
+
   const loadDashboard = useCallback(async (
     selectedCategory = category,
     showLoader = true,
@@ -1104,17 +1281,37 @@ function App() {
     try {
       const data = await getImportedDashboard(selectedCategory, selectedPerformancePeriod)
       setDashboard(data)
+      await loadSipJobOperationsStatus(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load imported portfolio")
     } finally {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [category, performancePeriod])
+  }, [category, loadSipJobOperationsStatus, performancePeriod])
 
   useEffect(() => {
+    if (!currentUser) {
+      setDashboard(null)
+      setLoading(false)
+      setRefreshing(false)
+      return
+    }
     loadDashboard(category, true, performancePeriod)
-  }, [category, performancePeriod, loadDashboard])
+  }, [category, currentUser, performancePeriod, loadDashboard])
+
+  useEffect(() => {
+    if (!currentUser) {
+      setSipJobStatus(null)
+      return
+    }
+    loadSipJobOperationsStatus(true)
+  }, [currentUser, loadSipJobOperationsStatus])
+
+  useEffect(() => {
+    bootstrapSession()
+    loadNiftyTicker()
+  }, [bootstrapSession, loadNiftyTicker])
 
   useEffect(() => {
     document.body.dataset.theme = themeMode
@@ -1302,15 +1499,40 @@ function App() {
     }
   }
 
+  async function handleRunSipJob(force = false) {
+    setRunningSipJob(true)
+    setError("")
+    setNotice("")
+
+    try {
+      const result = await runSipJob(force)
+      if (result.status === "skipped") {
+        setNotice("SIP job was already completed today. Use force rerun to run again.")
+      } else {
+        setNotice(`SIP job completed. Processed ${result.processed_sips ?? 0} SIP transaction(s).`)
+      }
+      await loadDashboard(category, false)
+      await loadSipJobOperationsStatus(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "SIP job trigger failed")
+    } finally {
+      setRunningSipJob(false)
+    }
+  }
+
   const overview = dashboard?.overview
   const holdings = useMemo(() => dashboard?.holdings ?? [], [dashboard])
   const benchmark = dashboard?.benchmark
   const benchmarkCharts = dashboard?.benchmark_charts ?? []
   const riskMetrics = dashboard?.risk_metrics
   const performanceComparison = dashboard?.performance_comparison
-  const recurringSips = dashboard?.recurring_sips ?? []
+  const recurringSips = useMemo(() => dashboard?.recurring_sips ?? [], [dashboard])
   const assetAllocation = dashboard?.asset_allocation ?? []
+  const sectorAllocation = useMemo(() => dashboard?.sector_allocation ?? [], [dashboard])
   const categories = overview?.available_categories ?? ["ALL"]
+  const sipScheduler = sipJobStatus?.scheduler
+  const sipTotals = sipJobStatus?.totals
+  const sipLastRun = sipJobStatus?.last_run
 
   const filteredHoldings = useMemo(() => {
     let nextHoldings = holdings
@@ -1383,28 +1605,82 @@ function App() {
     ? `${allocationFilter.type === "asset" ? "Asset" : "Sector"}: ${allocationFilter.value}`
     : null
   const marketTickerItems = useMemo(() => {
-    return holdings
-      .map((holding) => {
-        const currentValue = Number(holding.current_value ?? 0)
-        const oneDayChange = Number(holding.one_day_change ?? 0)
-        const previousValue = currentValue - oneDayChange
-        if (previousValue <= 0) {
-          return null
-        }
+    return niftyTickerRows.map((row) => ({
+      symbol: row.symbol,
+      name: row.name || row.symbol,
+      change: Number(row.change_percent || 0)
+    }))
+  }, [niftyTickerRows])
 
-        const percentChange = (oneDayChange / previousValue) * 100
-        if (!Number.isFinite(percentChange)) {
-          return null
-        }
+  const topGainers = useMemo(() => {
+    return [...marketTickerItems]
+      .filter((item) => Number(item.change || 0) > 0)
+      .sort((a, b) => Number(b.change || 0) - Number(a.change || 0))
+      .slice(0, 3)
+  }, [marketTickerItems])
 
-        return {
-          symbol: holding.symbol,
-          name: holding.company_name || holding.symbol,
-          change: percentChange
-        }
-      })
-      .filter(Boolean)
-  }, [holdings])
+  const topLosers = useMemo(() => {
+    return [...marketTickerItems]
+      .filter((item) => Number(item.change || 0) < 0)
+      .sort((a, b) => Number(a.change || 0) - Number(b.change || 0))
+      .slice(0, 3)
+  }, [marketTickerItems])
+
+  const upcomingSipRuns = useMemo(() => {
+    return [...recurringSips]
+      .filter((sip) => sip.active && sip.next_run_date)
+      .sort(
+        (a, b) =>
+          new Date(a.next_run_date).getTime() - new Date(b.next_run_date).getTime()
+      )
+      .slice(0, 5)
+  }, [recurringSips])
+
+  const monthlySipCommitment = useMemo(() => {
+    return recurringSips
+      .filter((sip) => sip.active)
+      .reduce((sum, sip) => sum + Number(sip.amount || 0), 0)
+  }, [recurringSips])
+
+  const rebalanceSignals = useMemo(() => {
+    const sectors = sectorAllocation.filter(
+      (item) => Number(item.weight_percent || 0) > 0
+    )
+
+    if (!sectors.length) {
+      return {
+        targetWeight: null,
+        overweight: [],
+        underweight: []
+      }
+    }
+
+    const targetWeight = 100 / sectors.length
+    const threshold = 1
+    const withGap = sectors.map((item) => {
+      const currentWeight = Number(item.weight_percent || 0)
+      return {
+        ...item,
+        currentWeight,
+        gap: currentWeight - targetWeight
+      }
+    })
+
+    const overweight = withGap
+      .filter((item) => item.gap > threshold)
+      .sort((a, b) => b.gap - a.gap)
+      .slice(0, 3)
+    const underweight = withGap
+      .filter((item) => item.gap < -threshold)
+      .sort((a, b) => a.gap - b.gap)
+      .slice(0, 3)
+
+    return {
+      targetWeight,
+      overweight,
+      underweight
+    }
+  }, [sectorAllocation])
 
   function jumpToHoldings() {
     const holdingsSection = document.getElementById("holdings-section")
@@ -1421,9 +1697,90 @@ function App() {
     }))
   }
 
+  function handleAuthFormChange(event) {
+    const { name, value } = event.target
+    setAuthForm((current) => ({
+      ...current,
+      [name]: value
+    }))
+  }
+
+  function openAuthModal(mode = "login") {
+    setAccountMenuOpen(false)
+    setAuthMode(mode)
+    setAuthModalOpen(true)
+    setAuthForm({
+      username: "",
+      email: "",
+      login: "",
+      password: "",
+      confirmPassword: ""
+    })
+  }
+
+  function closeAuthModal() {
+    setAuthModalOpen(false)
+    setSubmittingAuth(false)
+  }
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault()
+    setSubmittingAuth(true)
+    setError("")
+    setNotice("")
+
+    try {
+      if (authMode === "login") {
+        const result = await login({
+          login: authForm.login,
+          password: authForm.password
+        })
+        setCurrentUser(result.user)
+        setCategory("ALL")
+        setNotice(`Welcome back, ${result.user.username}.`)
+      } else {
+        if (authForm.password !== authForm.confirmPassword) {
+          throw new Error("Password and confirm password must match")
+        }
+        await signup({
+          username: authForm.username,
+          email: authForm.email,
+          password: authForm.password
+        })
+        const result = await login({
+          login: authForm.email,
+          password: authForm.password
+        })
+        setCurrentUser(result.user)
+        setCategory("ALL")
+        setNotice(`Account created. You are logged in as ${result.user.username}.`)
+      }
+      closeAuthModal()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Authentication failed")
+    } finally {
+      setSubmittingAuth(false)
+    }
+  }
+
+  async function handleLogout() {
+    setError("")
+    setNotice("")
+    try {
+      await logout()
+    } catch {
+      clearStoredSession()
+    }
+    setAccountMenuOpen(false)
+    setCategory("ALL")
+    setAllocationFilter(null)
+    setCurrentUser(null)
+    setNotice("Logged out successfully.")
+  }
+
   return (
     <div className={`app-shell ${themeMode === "light" ? "light-theme" : "dark-theme"}`}>
-      <MarketTicker items={marketTickerItems} />
+      {currentUser ? <MarketTicker items={marketTickerItems} /> : null}
 
       <header className="app-header">
         <div className="header-brand">Portfolio Tracker</div>
@@ -1438,56 +1795,84 @@ function App() {
         </label>
 
         <div className="header-actions">
-          <button
-            type="button"
-            className="header-link theme-toggle"
-            onClick={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}
-          >
-            {themeMode === "dark" ? "Light" : "Dark"}
-          </button>
-          <button
-            type="button"
-            className="header-link"
-            onClick={() => setPriceAlertOpen(true)}
-          >
-            Price Alerts
-          </button>
-          <button type="button" className="header-link" onClick={jumpToHoldings}>
-            Holdings
-          </button>
-          <button
-            type="button"
-            className="icon-button"
-            aria-label="Refresh market data"
-            onClick={handleRefresh}
-            disabled={refreshing || !dashboard}
-          >
-            <svg viewBox="0 0 24 24" role="presentation" focusable="false">
-              <path d="M17.6 6.3A7 7 0 1 0 19 13h-2a5 5 0 1 1-1-4l-2 2h6V5l-2.4 1.3Z" />
-            </svg>
-          </button>
+          {currentUser ? (
+            <>
+              <button
+                type="button"
+                className="header-link theme-toggle"
+                onClick={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}
+              >
+                {themeMode === "dark" ? "Light" : "Dark"}
+              </button>
+              <button
+                type="button"
+                className="header-link"
+                onClick={() => setPriceAlertOpen(true)}
+              >
+                Price Alerts
+              </button>
+              <button type="button" className="header-link" onClick={jumpToHoldings}>
+                Holdings
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Refresh market data"
+                onClick={handleRefresh}
+                disabled={refreshing || !dashboard}
+              >
+                <svg viewBox="0 0 24 24" role="presentation" focusable="false">
+                  <path d="M17.6 6.3A7 7 0 1 0 19 13h-2a5 5 0 1 1-1-4l-2 2h6V5l-2.4 1.3Z" />
+                </svg>
+              </button>
+            </>
+          ) : null}
           <div className="account-wrap" ref={accountMenuRef}>
             <button
               type="button"
               className="header-link"
               onClick={() => setAccountMenuOpen((open) => !open)}
             >
-              Login / Signup
+              {currentUser ? currentUser.username : "Login / Signup"}
             </button>
             {accountMenuOpen ? (
               <div className="account-menu">
-                <button type="button">Profile</button>
-                <button type="button">Account settings</button>
-                <button type="button">Support</button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    uploadInputRef.current?.click()
-                    setAccountMenuOpen(false)
-                  }}
-                >
-                  {uploading ? "Uploading..." : "Upload holdings file"}
-                </button>
+                {currentUser ? (
+                  <button type="button" disabled>
+                    Signed in as {currentUser.username}
+                  </button>
+                ) : (
+                  <>
+                    <button type="button" onClick={() => openAuthModal("login")}>
+                      Login
+                    </button>
+                    <button type="button" onClick={() => openAuthModal("signup")}>
+                      Signup
+                    </button>
+                  </>
+                )}
+                {currentUser ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      uploadInputRef.current?.click()
+                      setAccountMenuOpen(false)
+                    }}
+                  >
+                    {uploading ? "Uploading..." : "Upload holdings file"}
+                  </button>
+                ) : null}
+                {currentUser ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAccountMenuOpen(false)
+                      handleLogout()
+                    }}
+                  >
+                    Logout
+                  </button>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -1505,7 +1890,20 @@ function App() {
       {error ? <div className="banner error-banner">{error}</div> : null}
       {notice ? <div className="banner success-banner">{notice}</div> : null}
 
-      {loading ? (
+      {!currentUser ? (
+        <section className="panel empty-panel">
+          <p className="panel-kicker">Authentication required</p>
+          <h3>Please login or signup to access your portfolio dashboard.</h3>
+          <div className="sip-job-actions">
+            <button className="secondary-button" type="button" onClick={() => openAuthModal("login")}>
+              Login
+            </button>
+            <button className="ghost-button" type="button" onClick={() => openAuthModal("signup")}>
+              Signup
+            </button>
+          </div>
+        </section>
+      ) : loading ? (
         <div className="loading-panel">Loading imported portfolio...</div>
       ) : !dashboard ? (
         <section className="panel empty-panel">
@@ -1651,6 +2049,139 @@ function App() {
               <h2>{dashboard.portfolio_avg_pe !== null ? formatNumber(dashboard.portfolio_avg_pe, 2) : "N/A"}</h2>
               <span>vs Nifty 50: {dashboard.benchmark_pe_gap !== null ? formatNumber(dashboard.benchmark_pe_gap, 2) : "N/A"}</span>
             </article>
+            <article className="summary-card neutral sip-job-card">
+              <p>SIP Automation</p>
+              <h2>{sipLastRun?.status || "Not run yet"}</h2>
+              <span>
+                Last run: {sipLastRun?.ended_at ? formatDateTime(sipLastRun.ended_at) : "N/A"} · Total processed:{" "}
+                {sipTotals?.processed_sips_total ?? 0}
+              </span>
+              <span>
+                Next schedule: {sipScheduler?.next_run_at ? formatDateTime(sipScheduler.next_run_at) : "Pending"} ·{" "}
+                IST {String(sipScheduler?.hour ?? 9).padStart(2, "0")}:{String(sipScheduler?.minute ?? 5).padStart(2, "0")}
+              </span>
+              <div className="sip-job-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => handleRunSipJob(false)}
+                  disabled={runningSipJob}
+                >
+                  {runningSipJob ? "Running..." : "Run now"}
+                </button>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  onClick={() => handleRunSipJob(true)}
+                  disabled={runningSipJob}
+                >
+                  Force rerun
+                </button>
+              </div>
+            </article>
+            <article className="summary-card neutral movers-card">
+              <p>Nifty 50 Top Movers</p>
+              <h2>Top 3</h2>
+              <div className="sip-movers-grid">
+                <div>
+                  <strong className="sip-movers-title positive">Gainers</strong>
+                  {topGainers.length ? (
+                    <ul className="sip-movers-list">
+                      {topGainers.map((item) => (
+                        <li key={`g-${item.symbol}`}>
+                          <span>{item.symbol}</span>
+                          <b className="mover-positive">{formatPercent(item.change)}</b>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="empty-state">N/A</p>
+                  )}
+                </div>
+                <div>
+                  <strong className="sip-movers-title negative">Losers</strong>
+                  {topLosers.length ? (
+                    <ul className="sip-movers-list">
+                      {topLosers.map((item) => (
+                        <li key={`l-${item.symbol}`}>
+                          <span>{item.symbol}</span>
+                          <b className="mover-negative">{formatPercent(item.change)}</b>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="empty-state">N/A</p>
+                  )}
+                </div>
+              </div>
+            </article>
+            <article className="summary-card neutral calendar-card">
+              <p>Upcoming SIP Calendar</p>
+              <h2>{upcomingSipRuns.length ? `${upcomingSipRuns.length} Upcoming` : "N/A"}</h2>
+              <span>Monthly commitment: {formatCurrency(monthlySipCommitment)}</span>
+              {upcomingSipRuns.length ? (
+                <ul className="insight-list">
+                  {upcomingSipRuns.map((sip) => (
+                    <li key={`sip-${sip.id}`}>
+                      <div>
+                        <strong>{sip.symbol}</strong>
+                        <small>{formatDate(sip.next_run_date)}</small>
+                      </div>
+                      <b>{formatCurrency(sip.amount)}</b>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="empty-state">N/A</p>
+              )}
+            </article>
+            <article className="summary-card neutral rebalance-card">
+              <p>Rebalance Signals</p>
+              <h2>
+                {rebalanceSignals.targetWeight !== null
+                  ? `Target ${formatNumber(rebalanceSignals.targetWeight, 2)}%`
+                  : "N/A"}
+              </h2>
+              <span>Equal-weight baseline by sector</span>
+              <div className="rebalance-grid">
+                <div>
+                  <strong className="sip-movers-title negative">Overweight</strong>
+                  {rebalanceSignals.overweight.length ? (
+                    <ul className="insight-list">
+                      {rebalanceSignals.overweight.map((item) => (
+                        <li key={`over-${item.name}`}>
+                          <div>
+                            <strong>{item.name}</strong>
+                            <small>Current {formatNumber(item.currentWeight, 2)}%</small>
+                          </div>
+                          <b className="mover-negative">Trim {formatNumber(item.gap, 2)}%</b>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="empty-state">N/A</p>
+                  )}
+                </div>
+                <div>
+                  <strong className="sip-movers-title positive">Underweight</strong>
+                  {rebalanceSignals.underweight.length ? (
+                    <ul className="insight-list">
+                      {rebalanceSignals.underweight.map((item) => (
+                        <li key={`under-${item.name}`}>
+                          <div>
+                            <strong>{item.name}</strong>
+                            <small>Current {formatNumber(item.currentWeight, 2)}%</small>
+                          </div>
+                          <b className="mover-positive">Add {formatNumber(Math.abs(item.gap), 2)}%</b>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="empty-state">N/A</p>
+                  )}
+                </div>
+              </div>
+            </article>
           </section>
 
           <section className="panel-grid">
@@ -1793,6 +2324,16 @@ function App() {
         onClose={() => setPriceAlertOpen(false)}
         form={priceAlertForm}
         onChange={handlePriceAlertChange}
+      />
+      <AuthModal
+        open={authModalOpen}
+        mode={authMode}
+        form={authForm}
+        onChange={handleAuthFormChange}
+        onClose={closeAuthModal}
+        onSwitchMode={() => setAuthMode((current) => (current === "login" ? "signup" : "login"))}
+        onSubmit={handleAuthSubmit}
+        submitting={submittingAuth}
       />
     </div>
   )

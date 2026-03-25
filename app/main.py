@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Union
@@ -8,7 +10,9 @@ from app.schemas import (
     HoldingCreate,
     HoldingsImportPayload,
     ImportedHoldingTransactionCreate,
+    LoginPayload,
     RecurringSipCreate,
+    SignupPayload,
 )
 from app.services import (
     apply_imported_holding_transaction,
@@ -24,17 +28,34 @@ from app.services import (
     calculate_tracking_error,
     calculate_volatility,
     create_recurring_sip,
+    create_user_account,
     get_imported_portfolio_dashboard,
+    get_nifty50_ticker_snapshot,
+    get_sip_job_status,
+    get_user_from_token,
     import_holdings_workbook,
+    login_user_account,
+    logout_user_session,
+    run_sip_job,
     refresh_imported_holdings_market_data,
     update_prices,
 )
 from app.schemas import TransactionCreate
 from app.models import Transaction
 from app.services import create_transaction, create_transactions
+from app.scheduler import get_sip_scheduler_status, start_sip_scheduler, stop_sip_scheduler
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    start_sip_scheduler()
+    try:
+        yield
+    finally:
+        stop_sip_scheduler()
+
+
+app = FastAPI(lifespan=lifespan)
 Base.metadata.create_all(bind=engine)
 app.add_middleware(
     CORSMiddleware,
@@ -54,6 +75,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 
 @app.get("/")
 def root():
@@ -213,3 +235,67 @@ def imported_dashboard(
         category=category,
         performance_period=performance_period,
     )
+
+
+@app.get("/admin/sips/status")
+def sip_job_status(db: Session = Depends(get_db)):
+    status = get_sip_job_status(db)
+    status["scheduler"] = get_sip_scheduler_status()
+    return status
+
+
+@app.post("/admin/sips/run")
+def run_sip_processing_job(
+    force: bool = Query(default=False),
+    db: Session = Depends(get_db),
+):
+    try:
+        return run_sip_job(db, trigger="MANUAL", force=force)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/market/nifty50")
+def nifty50_snapshot():
+    return get_nifty50_ticker_snapshot()
+
+
+@app.post("/auth/signup")
+def signup(payload: SignupPayload, db: Session = Depends(get_db)):
+    try:
+        return create_user_account(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/auth/login")
+def login(payload: LoginPayload, db: Session = Depends(get_db)):
+    try:
+        return login_user_account(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.get("/auth/me")
+def me(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else ""
+    user = get_user_from_token(db, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return user
+
+
+@app.post("/auth/logout")
+def logout(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing session token")
+    if not logout_user_session(db, token):
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    return {"message": "Logged out successfully"}

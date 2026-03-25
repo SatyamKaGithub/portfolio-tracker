@@ -1,7 +1,26 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
+const AUTH_TOKEN_KEY = "portfolio_tracker_auth_token"
+
+function getStoredToken() {
+  return localStorage.getItem(AUTH_TOKEN_KEY) || ""
+}
+
+function buildAuthHeaders(headers = {}) {
+  const token = getStoredToken()
+  if (!token) {
+    return headers
+  }
+  return {
+    ...headers,
+    Authorization: `Bearer ${token}`
+  }
+}
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, options)
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: buildAuthHeaders(options.headers || {})
+  })
   const contentType = response.headers.get("content-type") || ""
   const payload = contentType.includes("application/json")
     ? await response.json()
@@ -135,4 +154,58 @@ export async function getImportedDashboard(category = "ALL", performancePeriod =
   return request(
     `/portfolio/imported-dashboard?category=${encodeURIComponent(category)}&performance_period=${encodeURIComponent(performancePeriod)}`
   )
+}
+
+export async function getSipJobStatus() {
+  return request("/admin/sips/status")
+}
+
+export async function runSipJob(force = false) {
+  return request(`/admin/sips/run?force=${force ? "true" : "false"}`, {
+    method: "POST"
+  })
+}
+
+export async function getNifty50Snapshot() {
+  return request("/market/nifty50")
+}
+
+export async function signup(payload) {
+  return request("/auth/signup", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function login(payload) {
+  const response = await request("/auth/login", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  })
+  if (response?.token) {
+    localStorage.setItem(AUTH_TOKEN_KEY, response.token)
+  }
+  return response
+}
+
+export async function getCurrentUser() {
+  return request("/auth/me")
+}
+
+export async function logout() {
+  const response = await request("/auth/logout", {
+    method: "POST"
+  })
+  localStorage.removeItem(AUTH_TOKEN_KEY)
+  return response
+}
+
+export function clearStoredSession() {
+  localStorage.removeItem(AUTH_TOKEN_KEY)
 }

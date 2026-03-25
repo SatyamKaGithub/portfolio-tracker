@@ -1,6 +1,7 @@
 from pydantic import BaseModel, field_validator
 from datetime import date as dt_date
 from typing import Optional, Literal, List
+import re
 
 
 class HoldingCreate(BaseModel):
@@ -223,3 +224,54 @@ class ImportedPortfolioDashboard(BaseModel):
     benchmark_pe_gap: Optional[float] = None
     import_file_name: Optional[str] = None
     imported_at: Optional[str] = None
+
+
+class SignupPayload(BaseModel):
+    username: str
+    email: str
+    password: str
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        cleaned = value.strip()
+        if len(cleaned) < 3:
+            raise ValueError("username must be at least 3 characters")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", cleaned):
+            raise ValueError("username can contain letters, numbers, ., _, and - only")
+        return cleaned
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if "@" not in cleaned or "." not in cleaned.split("@")[-1]:
+            raise ValueError("email is invalid")
+        return cleaned
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("password must be at least 8 characters")
+        return value
+
+
+class LoginPayload(BaseModel):
+    login: str
+    password: str
+
+    @field_validator("login")
+    @classmethod
+    def validate_login(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("login is required")
+        return cleaned
+
+    @field_validator("password")
+    @classmethod
+    def validate_login_password(cls, value: str) -> str:
+        if not value:
+            raise ValueError("password is required")
+        return value
