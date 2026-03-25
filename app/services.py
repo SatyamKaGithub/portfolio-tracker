@@ -1854,7 +1854,6 @@ def process_due_sips(db: Session) -> Dict[str, int]:
                 record_label="SIP_BUY",
             )
             processed += 1
-            sip.next_run_date = _add_months(run_date.replace(day=min(sip.day_of_month, 28)))
             target_month_date = _add_months(run_date.replace(day=1), 1)
             month_lengths = [31, 29 if target_month_date.year % 4 == 0 and (target_month_date.year % 100 != 0 or target_month_date.year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
             sip.next_run_date = date(
@@ -2115,7 +2114,7 @@ def get_imported_portfolio_dashboard(
     previous_day_value = total_current_value - one_day_change
     one_day_change_percent = (
         (one_day_change / previous_day_value) * 100
-        if previous_day_value not in (0, None)
+        if previous_day_value > 0
         else 0.0
     )
     total_gain_percent = ((total_gain / total_invested) * 100) if total_invested else 0.0

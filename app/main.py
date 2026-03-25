@@ -1,14 +1,16 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Union
 from app.db import engine, SessionLocal, Base
-from app.models import Holding, PortfolioSnapshot
+from app.models import Holding, PortfolioSnapshot, Transaction
 from app.schemas import (
     HoldingCreate,
     HoldingsImportPayload,
     ImportedHoldingTransactionCreate,
     RecurringSipCreate,
+    TransactionCreate,
 )
 from app.services import (
     apply_imported_holding_transaction,
@@ -24,14 +26,13 @@ from app.services import (
     calculate_tracking_error,
     calculate_volatility,
     create_recurring_sip,
+    create_transaction,
+    create_transactions,
     get_imported_portfolio_dashboard,
     import_holdings_workbook,
     refresh_imported_holdings_market_data,
     update_prices,
 )
-from app.schemas import TransactionCreate
-from app.models import Transaction
-from app.services import create_transaction, create_transactions
 
 
 app = FastAPI()
@@ -161,6 +162,9 @@ def add_transaction(
         return create_transaction(db, txn)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Database error while saving transaction") from exc
 
 @app.get("/transactions")
 def get_transactions(db: Session = Depends(get_db)):
