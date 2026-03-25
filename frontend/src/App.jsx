@@ -1385,6 +1385,7 @@ function App() {
       await loadDashboard(category, false)
     } catch (err) {
       setError(err instanceof Error ? err.message : "Refresh failed")
+    } finally {
       setRefreshing(false)
     }
   }

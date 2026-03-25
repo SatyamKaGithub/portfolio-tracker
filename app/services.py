@@ -1,7 +1,9 @@
 import base64
+import calendar
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
+import logging
 import math
 import os
 import re
@@ -38,6 +40,8 @@ from app.schemas import (
     SignupPayload,
     TransactionCreate,
 )
+
+logger = logging.getLogger(__name__)
 
 EPSILON = 1e-9
 TRADING_DAYS_PER_YEAR = 252
@@ -2242,17 +2246,17 @@ def process_due_sips(db: Session) -> Dict[str, int]:
                 record_label="SIP_BUY",
             )
             processed += 1
-            sip.next_run_date = _add_months(run_date.replace(day=min(sip.day_of_month, 28)))
             target_month_date = _add_months(run_date.replace(day=1), 1)
-            month_lengths = [31, 29 if target_month_date.year % 4 == 0 and (target_month_date.year % 100 != 0 or target_month_date.year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            days_in_target_month = calendar.monthrange(target_month_date.year, target_month_date.month)[1]
             sip.next_run_date = date(
                 target_month_date.year,
                 target_month_date.month,
-                min(sip.day_of_month, month_lengths[target_month_date.month - 1]),
+                min(sip.day_of_month, days_in_target_month),
             )
             try:
                 db.commit()
-            except Exception:
+            except Exception as exc:
+                logger.error("Failed to commit SIP run for %s on %s: %s", sip.id, run_date, exc)
                 db.rollback()
                 break
             _upsert_imported_portfolio_snapshot(
@@ -2429,10 +2433,11 @@ def _build_normalized_performance_comparison(
         }
 
     portfolio_start = next(
-        row["portfolio_value"] for row in snapshot_rows if row["date"] == common_dates[0]
+        (row["portfolio_value"] for row in snapshot_rows if row["date"] == common_dates[0]),
+        None,
     )
-    benchmark_start = benchmark_by_date[common_dates[0]]
-    if portfolio_start <= 0 or benchmark_start <= 0:
+    benchmark_start = benchmark_by_date.get(common_dates[0])
+    if portfolio_start is None or portfolio_start <= 0 or benchmark_start is None or benchmark_start <= 0:
         return {
             "benchmark": benchmark_symbol,
             "points": [],
