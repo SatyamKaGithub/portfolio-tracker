@@ -170,6 +170,36 @@ export async function getNifty50Snapshot() {
   return request("/market/nifty50")
 }
 
+export async function createPriceAlert(payload) {
+  return request("/alerts/price", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  })
+}
+
+export async function getPriceAlerts(includeInactive = false) {
+  return request(`/alerts/price?include_inactive=${includeInactive ? "true" : "false"}`)
+}
+
+export async function runPriceAlertCheck() {
+  return request("/alerts/price/check", {
+    method: "POST"
+  })
+}
+
+export async function getNotifications(limit = 20, unreadOnly = false) {
+  return request(`/notifications?limit=${limit}&unread_only=${unreadOnly ? "true" : "false"}`)
+}
+
+export async function markNotificationRead(notificationId) {
+  return request(`/notifications/${notificationId}/read`, {
+    method: "POST"
+  })
+}
+
 export async function signup(payload) {
   return request("/auth/signup", {
     method: "POST",

@@ -3,14 +3,19 @@ import {
   applyImportedHoldingTransaction,
   addRecurringSip,
   clearStoredSession,
+  createPriceAlert,
   getCurrentUser,
   getImportedDashboard,
+  getNotifications,
   getNifty50Snapshot,
+  getPriceAlerts,
   login,
+  markNotificationRead,
   importHoldingsWorkbook,
   logout,
   refreshImportedHoldings,
   getSipJobStatus,
+  runPriceAlertCheck,
   runSipJob,
   signup
 } from "./services/api"
@@ -864,7 +869,7 @@ function MarketNewsPanel({ items }) {
   )
 }
 
-function PriceAlertModal({ open, onClose, form, onChange }) {
+function PriceAlertModal({ open, onClose, form, onChange, onSubmit, submitting }) {
   if (!open) {
     return null
   }
@@ -888,7 +893,7 @@ function PriceAlertModal({ open, onClose, form, onChange }) {
           </button>
         </div>
 
-        <form className="transaction-form" onSubmit={(event) => event.preventDefault()}>
+        <form className="transaction-form" onSubmit={onSubmit}>
           <label>
             <span>Stock symbol</span>
             <input
@@ -897,6 +902,7 @@ function PriceAlertModal({ open, onClose, form, onChange }) {
               placeholder="e.g. RELIANCE"
               value={form.symbol}
               onChange={onChange}
+              required
             />
           </label>
           <label>
@@ -909,7 +915,15 @@ function PriceAlertModal({ open, onClose, form, onChange }) {
               placeholder="e.g. 3050"
               value={form.targetPrice}
               onChange={onChange}
+              required
             />
+          </label>
+          <label>
+            <span>Condition</span>
+            <select name="direction" value={form.direction} onChange={onChange}>
+              <option value="ABOVE">Alert when price goes above target</option>
+              <option value="BELOW">Alert when price goes below target</option>
+            </select>
           </label>
           <label>
             <span>Duration</span>
@@ -928,21 +942,92 @@ function PriceAlertModal({ open, onClose, form, onChange }) {
               <option value="BOTH">Email + in-app</option>
             </select>
           </label>
-          <div className="modal-note">
-            Placeholder feature: we have added the UI only. Trigger logic, notification engine, and
-            email delivery will be implemented in the next phase.
-          </div>
+          <div className="modal-note">Alerts are checked automatically in the background during market hours.</div>
           <div className="modal-actions">
             <button className="ghost-button" type="button" onClick={onClose}>
               Cancel
             </button>
-            <button className="secondary-button" type="button" disabled>
-              Save alert (coming soon)
+            <button className="secondary-button" type="submit" disabled={submitting}>
+              {submitting ? "Saving..." : "Save alert"}
             </button>
           </div>
         </form>
       </div>
     </div>
+  )
+}
+
+function NotificationsPanel({
+  notifications,
+  onMarkRead,
+  loading
+}) {
+  return (
+    <article className="summary-card neutral">
+      <p>Price Alert Inbox</p>
+      <h2>{notifications.filter((item) => !item.read).length} unread</h2>
+      {loading ? (
+        <span>Refreshing alerts...</span>
+      ) : notifications.length ? (
+        <ul className="insight-list">
+          {notifications.slice(0, 5).map((item) => (
+            <li key={item.id}>
+              <div>
+                <strong>{item.title}</strong>
+                <small>{formatDateTime(item.created_at)}</small>
+              </div>
+              {item.read ? (
+                <b>Read</b>
+              ) : (
+                <button className="ghost-button" type="button" onClick={() => onMarkRead(item.id)}>
+                  Mark read
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="empty-state">No notifications yet.</p>
+      )}
+    </article>
+  )
+}
+
+function PriceAlertsStatusPanel({
+  title,
+  alerts,
+  emptyText
+}) {
+  return (
+    <article className="summary-card neutral">
+      <p>{title}</p>
+      <h2>{alerts.length}</h2>
+      {alerts.length ? (
+        <ul className="insight-list">
+          {alerts.slice(0, 5).map((alert) => (
+            <li key={alert.id}>
+              <div>
+                <strong>{alert.symbol}</strong>
+                <small>
+                  {alert.direction === "ABOVE" ? "Above" : "Below"} {formatCurrency(alert.target_price)}
+                </small>
+              </div>
+              <b>
+                {alert.status === "EXPIRED"
+                  ? alert.expires_at
+                    ? `Expired ${formatDate(alert.expires_at)}`
+                    : "Expired"
+                  : alert.triggered_at
+                    ? formatDate(alert.triggered_at)
+                    : "Open"}
+              </b>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="empty-state">{emptyText}</p>
+      )}
+    </article>
   )
 }
 
@@ -1193,6 +1278,8 @@ function App() {
   const [submittingTransaction, setSubmittingTransaction] = useState(false)
   const [submittingAuth, setSubmittingAuth] = useState(false)
   const [runningSipJob, setRunningSipJob] = useState(false)
+  const [runningAlertCheck, setRunningAlertCheck] = useState(false)
+  const [savingPriceAlert, setSavingPriceAlert] = useState(false)
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
   const [sipJobStatus, setSipJobStatus] = useState(null)
@@ -1216,9 +1303,12 @@ function App() {
   const [themeMode, setThemeMode] = useState("dark")
   const [performancePeriod, setPerformancePeriod] = useState("1Y")
   const [priceAlertOpen, setPriceAlertOpen] = useState(false)
+  const [priceAlerts, setPriceAlerts] = useState([])
+  const [notifications, setNotifications] = useState([])
   const [priceAlertForm, setPriceAlertForm] = useState({
     symbol: "",
     targetPrice: "",
+    direction: "ABOVE",
     duration: "1_MONTH",
     channel: "IN_APP"
   })
@@ -1265,6 +1355,21 @@ function App() {
     }
   }, [])
 
+  const loadAlertCenter = useCallback(async (silent = true) => {
+    try {
+      const [alerts, inbox] = await Promise.all([
+        getPriceAlerts(true),
+        getNotifications(20, false)
+      ])
+      setPriceAlerts(Array.isArray(alerts) ? alerts : [])
+      setNotifications(Array.isArray(inbox) ? inbox : [])
+    } catch (err) {
+      if (!silent) {
+        setError(err instanceof Error ? err.message : "Failed to load price alerts")
+      }
+    }
+  }, [])
+
   const loadDashboard = useCallback(async (
     selectedCategory = category,
     showLoader = true,
@@ -1303,10 +1408,13 @@ function App() {
   useEffect(() => {
     if (!currentUser) {
       setSipJobStatus(null)
+      setPriceAlerts([])
+      setNotifications([])
       return
     }
     loadSipJobOperationsStatus(true)
-  }, [currentUser, loadSipJobOperationsStatus])
+    loadAlertCenter(true)
+  }, [currentUser, loadAlertCenter, loadSipJobOperationsStatus])
 
   useEffect(() => {
     bootstrapSession()
@@ -1604,6 +1712,18 @@ function App() {
   const filterLabel = allocationFilter
     ? `${allocationFilter.type === "asset" ? "Asset" : "Sector"}: ${allocationFilter.value}`
     : null
+  const activePriceAlerts = useMemo(
+    () => priceAlerts.filter((item) => item.status === "ACTIVE"),
+    [priceAlerts]
+  )
+  const expiredPriceAlerts = useMemo(
+    () => priceAlerts.filter((item) => item.status === "EXPIRED"),
+    [priceAlerts]
+  )
+  const triggeredPriceAlerts = useMemo(
+    () => priceAlerts.filter((item) => item.status === "TRIGGERED"),
+    [priceAlerts]
+  )
   const marketTickerItems = useMemo(() => {
     return niftyTickerRows.map((row) => ({
       symbol: row.symbol,
@@ -1695,6 +1815,65 @@ function App() {
       ...current,
       [name]: value
     }))
+  }
+
+  async function handlePriceAlertSubmit(event) {
+    event.preventDefault()
+    setSavingPriceAlert(true)
+    setError("")
+    setNotice("")
+
+    try {
+      const result = await createPriceAlert({
+        symbol: priceAlertForm.symbol,
+        target_price: Number(priceAlertForm.targetPrice),
+        direction: priceAlertForm.direction,
+        duration: priceAlertForm.duration,
+        channel: priceAlertForm.channel
+      })
+      setNotice(
+        `Alert created for ${result.symbol}: ${result.direction === "ABOVE" ? "above" : "below"} ${formatCurrency(result.target_price)}.`
+      )
+      setPriceAlertOpen(false)
+      setPriceAlertForm({
+        symbol: "",
+        targetPrice: "",
+        direction: "ABOVE",
+        duration: "1_MONTH",
+        channel: "IN_APP"
+      })
+      await loadAlertCenter(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create price alert")
+    } finally {
+      setSavingPriceAlert(false)
+    }
+  }
+
+  async function handleRunAlertCheck() {
+    setRunningAlertCheck(true)
+    setError("")
+    setNotice("")
+    try {
+      const result = await runPriceAlertCheck()
+      setNotice(
+        `Alert scan completed: checked ${result.checked_alerts ?? 0}, triggered ${result.triggered_alerts ?? 0}.`
+      )
+      await loadAlertCenter(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to run alert check")
+    } finally {
+      setRunningAlertCheck(false)
+    }
+  }
+
+  async function handleMarkNotificationRead(notificationId) {
+    try {
+      await markNotificationRead(notificationId)
+      await loadAlertCenter(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to mark notification read")
+    }
   }
 
   function handleAuthFormChange(event) {
@@ -2079,6 +2258,45 @@ function App() {
                 </button>
               </div>
             </article>
+            <article className="summary-card neutral">
+              <p>Price Alerts</p>
+              <h2>{activePriceAlerts.length} active</h2>
+              <span>
+                Triggered: {triggeredPriceAlerts.length} · Expired: {expiredPriceAlerts.length}
+              </span>
+              <div className="sip-job-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={handleRunAlertCheck}
+                  disabled={runningAlertCheck}
+                >
+                  {runningAlertCheck ? "Checking..." : "Run alert scan"}
+                </button>
+                <button
+                  className="ghost-button"
+                  type="button"
+                  onClick={() => setPriceAlertOpen(true)}
+                >
+                  New alert
+                </button>
+              </div>
+            </article>
+            <NotificationsPanel
+              notifications={notifications}
+              onMarkRead={handleMarkNotificationRead}
+              loading={runningAlertCheck}
+            />
+            <PriceAlertsStatusPanel
+              title="Active Alerts"
+              alerts={activePriceAlerts}
+              emptyText="No active alerts."
+            />
+            <PriceAlertsStatusPanel
+              title="Expired Alerts"
+              alerts={expiredPriceAlerts}
+              emptyText="No expired alerts."
+            />
             <article className="summary-card neutral movers-card">
               <p>Nifty 50 Top Movers</p>
               <h2>Top 3</h2>
@@ -2324,6 +2542,8 @@ function App() {
         onClose={() => setPriceAlertOpen(false)}
         form={priceAlertForm}
         onChange={handlePriceAlertChange}
+        onSubmit={handlePriceAlertSubmit}
+        submitting={savingPriceAlert}
       />
       <AuthModal
         open={authModalOpen}

@@ -275,3 +275,54 @@ class LoginPayload(BaseModel):
         if not value:
             raise ValueError("password is required")
         return value
+
+
+class PriceAlertCreate(BaseModel):
+    symbol: str
+    target_price: float
+    direction: Literal["ABOVE", "BELOW"]
+    duration: Literal["1_WEEK", "1_MONTH", "3_MONTHS", "UNTIL_HIT"] = "UNTIL_HIT"
+    channel: Literal["IN_APP", "EMAIL", "BOTH"] = "IN_APP"
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_alert_symbol(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not normalized:
+            raise ValueError("symbol is required")
+        return normalized
+
+    @field_validator("target_price")
+    @classmethod
+    def validate_target_price(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("target_price must be greater than zero")
+        return value
+
+
+class PriceAlertSummary(BaseModel):
+    id: int
+    symbol: str
+    target_price: float
+    direction: str
+    duration: str
+    channel: str
+    status: str
+    last_checked_price: Optional[float] = None
+    triggered_price: Optional[float] = None
+    note: Optional[str] = None
+    triggered_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AlertNotificationSummary(BaseModel):
+    id: int
+    alert_id: int
+    channel: str
+    title: str
+    message: str
+    delivery_status: str
+    read: bool
+    read_at: Optional[str] = None
+    created_at: Optional[str] = None

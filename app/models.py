@@ -6,6 +6,7 @@ class Holding(Base):
     __tablename__ = "holdings"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     symbol = Column(String, index=True)
     quantity = Column(Float)
     avg_price = Column(Float)
@@ -24,10 +25,11 @@ class Price(Base):
 class PortfolioSnapshot(Base):
     __tablename__ = "portfolio_snapshots"
     __table_args__ = (
-        UniqueConstraint("date", name="uq_portfolio_snapshots_date"),
+        UniqueConstraint("user_id", "date", name="uq_portfolio_snapshots_user_date"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     total_value = Column(Float)
     total_invested = Column(Float)
     pnl = Column(Float)
@@ -37,10 +39,11 @@ class PortfolioSnapshot(Base):
 class ImportedPortfolioSnapshot(Base):
     __tablename__ = "imported_portfolio_snapshots"
     __table_args__ = (
-        UniqueConstraint("date", name="uq_imported_portfolio_snapshots_date"),
+        UniqueConstraint("user_id", "date", name="uq_imported_portfolio_snapshots_user_date"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     total_value = Column(Float)
     total_invested = Column(Float)
     pnl = Column(Float)
@@ -50,6 +53,7 @@ class Transaction(Base):
     __tablename__ = "transactions"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     symbol = Column(String, index=True)
     quantity = Column(Float)
     price = Column(Float)
@@ -61,6 +65,7 @@ class ImportedHolding(Base):
     __tablename__ = "imported_holdings"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     symbol = Column(String, index=True)
     company_name = Column(String, nullable=True)
     isin = Column(String, nullable=True)
@@ -86,6 +91,7 @@ class ImportedHoldingTransaction(Base):
     __tablename__ = "imported_holding_transactions"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     symbol = Column(String, index=True)
     quantity = Column(Float)
     price = Column(Float)
@@ -98,6 +104,7 @@ class RecurringSip(Base):
     __tablename__ = "recurring_sips"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     symbol = Column(String, index=True)
     amount = Column(Float)
     start_date = Column(Date, default=date.today)
@@ -110,10 +117,11 @@ class RecurringSip(Base):
 class SipJobRun(Base):
     __tablename__ = "sip_job_runs"
     __table_args__ = (
-        UniqueConstraint("run_date", name="uq_sip_job_runs_run_date"),
+        UniqueConstraint("user_id", "run_date", name="uq_sip_job_runs_user_run_date"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
     run_date = Column(Date, default=date.today, index=True)
     trigger = Column(String, default="SCHEDULED")
     status = Column(String, default="PENDING")  # PENDING/RUNNING/SUCCESS/FAILED/SKIPPED
@@ -145,3 +153,43 @@ class UserSession(Base):
     token = Column(String, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     expires_at = Column(DateTime, index=True)
+
+
+class PriceAlert(Base):
+    __tablename__ = "price_alerts"
+    __table_args__ = (
+        UniqueConstraint("id", "user_id", name="uq_price_alerts_id_user_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    symbol = Column(String, index=True)
+    target_price = Column(Float)
+    direction = Column(String, default="ABOVE")  # ABOVE or BELOW
+    duration = Column(String, default="UNTIL_HIT")  # 1_WEEK / 1_MONTH / 3_MONTHS / UNTIL_HIT
+    channel = Column(String, default="IN_APP")  # IN_APP / EMAIL / BOTH
+    status = Column(String, default="ACTIVE")  # ACTIVE / TRIGGERED / EXPIRED / DISABLED
+    note = Column(String, nullable=True)
+    last_checked_price = Column(Float, nullable=True)
+    triggered_price = Column(Float, nullable=True)
+    triggered_at = Column(DateTime, nullable=True, index=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class AlertNotification(Base):
+    __tablename__ = "alert_notifications"
+    __table_args__ = (
+        UniqueConstraint("id", "user_id", name="uq_alert_notifications_id_user_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, index=True)
+    alert_id = Column(Integer, index=True)
+    channel = Column(String, default="IN_APP")  # IN_APP / EMAIL
+    title = Column(String)
+    message = Column(String)
+    delivery_status = Column(String, default="CREATED")  # CREATED / SENT / FAILED / SKIPPED
+    read_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)

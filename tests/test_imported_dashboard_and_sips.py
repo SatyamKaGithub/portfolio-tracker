@@ -9,6 +9,7 @@ def test_process_due_sips_creates_transaction_and_updates_next_run_date(db_sessi
     today = date.today()
 
     holding = ImportedHolding(
+        user_id=1,
         symbol="AXISMF",
         company_name="Axis Flexicap",
         asset_type="MUTUAL_FUND",
@@ -24,6 +25,7 @@ def test_process_due_sips_creates_transaction_and_updates_next_run_date(db_sessi
         imported_at=datetime(2026, 1, 1, 9, 0, 0),
     )
     sip = RecurringSip(
+        user_id=1,
         symbol="AXISMF",
         amount=500,
         start_date=today,
@@ -38,7 +40,7 @@ def test_process_due_sips_creates_transaction_and_updates_next_run_date(db_sessi
     monkeypatch.setattr("app.services._fetch_close_for_date", lambda *_: 100.0)
     monkeypatch.setattr("app.services._upsert_imported_portfolio_snapshot", lambda *args, **kwargs: True)
 
-    result = process_due_sips(db_session)
+    result = process_due_sips(db_session, user_id=1)
     assert result["processed_sips"] == 1
 
     updated_holding = db_session.query(ImportedHolding).filter_by(symbol="AXISMF").first()
@@ -56,6 +58,7 @@ def test_process_due_sips_creates_transaction_and_updates_next_run_date(db_sessi
 
 def test_create_recurring_sip_creates_schedule_and_triggers_processing(db_session, monkeypatch):
     holding = ImportedHolding(
+        user_id=1,
         symbol="PPFAS",
         company_name="Parag Parikh Flexi Cap",
         asset_type="MUTUAL_FUND",
@@ -74,14 +77,14 @@ def test_create_recurring_sip_creates_schedule_and_triggers_processing(db_sessio
 
     calls = {"count": 0}
 
-    def fake_process_due_sips(db):
+    def fake_process_due_sips(*args, **kwargs):
         calls["count"] += 1
         return {"processed_sips": 0}
 
     monkeypatch.setattr("app.services.process_due_sips", fake_process_due_sips)
 
     payload = RecurringSipCreate(symbol="PPFAS", amount=2500, start_date=date(2026, 1, 10))
-    result = create_recurring_sip(db_session, payload)
+    result = create_recurring_sip(db_session, payload, user_id=1)
 
     assert result["symbol"] == "PPFAS"
     assert result["amount"] == 2500
@@ -93,6 +96,7 @@ def test_create_recurring_sip_creates_schedule_and_triggers_processing(db_sessio
 def test_create_recurring_sip_rejects_non_mutual_fund(db_session):
     db_session.add(
         ImportedHolding(
+            user_id=1,
             symbol="INFY",
             company_name="Infosys",
             asset_type="STOCK",
@@ -112,7 +116,7 @@ def test_create_recurring_sip_rejects_non_mutual_fund(db_session):
     payload = RecurringSipCreate(symbol="INFY", amount=500, start_date=date(2026, 2, 1))
 
     try:
-        create_recurring_sip(db_session, payload)
+        create_recurring_sip(db_session, payload, user_id=1)
         assert False, "Expected ValueError"
     except ValueError as exc:
         assert "currently supported only for mutual funds" in str(exc)
@@ -122,6 +126,7 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
     db_session.add_all(
         [
             ImportedHolding(
+                user_id=1,
                 symbol="HDFCBANK",
                 company_name="HDFC Bank",
                 asset_type="STOCK",
@@ -140,6 +145,7 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
                 imported_at=datetime(2026, 1, 5, 10, 0, 0),
             ),
             ImportedHolding(
+                user_id=1,
                 symbol="AXISMF",
                 company_name="Axis Flexicap",
                 asset_type="MUTUAL_FUND",
@@ -158,6 +164,7 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
                 imported_at=datetime(2026, 1, 6, 10, 0, 0),
             ),
             RecurringSip(
+                user_id=1,
                 symbol="AXISMF",
                 amount=2000,
                 start_date=date(2026, 1, 6),
@@ -169,8 +176,8 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
     )
     db_session.commit()
 
-    monkeypatch.setattr("app.services._ensure_imported_snapshot_history", lambda db: None)
-    monkeypatch.setattr("app.services.process_due_sips", lambda db: {"processed_sips": 0})
+    monkeypatch.setattr("app.services._ensure_imported_snapshot_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.services.process_due_sips", lambda *args, **kwargs: {"processed_sips": 0})
     monkeypatch.setattr(
         "app.services._fetch_benchmark_mini_chart",
         lambda symbol, name: {
@@ -197,7 +204,7 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
     )
     monkeypatch.setattr(
         "app.services._calculate_imported_risk_metrics",
-        lambda db, benchmark_symbol="^NSEI": {
+        lambda *args, **kwargs: {
             "sharpe_ratio": 1.5,
             "beta": 0.9,
             "alpha_annualized_percent": 3.2,
@@ -215,7 +222,7 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
         },
     )
 
-    dashboard = get_imported_portfolio_dashboard(db_session, category="ALL", performance_period="1Y")
+    dashboard = get_imported_portfolio_dashboard(db_session, category="ALL", performance_period="1Y", user_id=1)
 
     assert dashboard["overview"]["total_net_worth"] == 2800
     assert dashboard["overview"]["holdings_count"] == 2
@@ -226,6 +233,6 @@ def test_imported_dashboard_uses_stubbed_market_data_and_filters_category(db_ses
     assert dashboard["benchmark_pe_gap"] == -2.0
     assert len(dashboard["recurring_sips"]) == 1
 
-    mf_dashboard = get_imported_portfolio_dashboard(db_session, category="MUTUAL_FUND", performance_period="1Y")
+    mf_dashboard = get_imported_portfolio_dashboard(db_session, category="MUTUAL_FUND", performance_period="1Y", user_id=1)
     assert mf_dashboard["overview"]["holdings_count"] == 1
     assert mf_dashboard["holdings"][0]["symbol"] == "AXISMF"

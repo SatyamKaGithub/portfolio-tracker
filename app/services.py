@@ -1,11 +1,13 @@
 import base64
 from datetime import date, datetime, timedelta, timezone
+from email.message import EmailMessage
 import hashlib
 import hmac
 import math
 import os
 import re
 import secrets
+import smtplib
 import time
 from typing import Dict, List, Optional, Tuple
 from urllib import request as urlrequest
@@ -18,10 +20,12 @@ from sqlalchemy.orm import Session
 
 from app.importers import decode_base64_document, parse_xlsx_holdings
 from app.models import (
+    AlertNotification,
     Holding,
     ImportedHolding,
     ImportedPortfolioSnapshot,
     ImportedHoldingTransaction,
+    PriceAlert,
     RecurringSip,
     SipJobRun,
     User,
@@ -31,9 +35,12 @@ from app.models import (
     Transaction,
 )
 from app.schemas import (
+    AlertNotificationSummary,
     HoldingsImportPayload,
     ImportedHoldingTransactionCreate,
     LoginPayload,
+    PriceAlertCreate,
+    PriceAlertSummary,
     RecurringSipCreate,
     SignupPayload,
     TransactionCreate,
@@ -110,10 +117,19 @@ _NIFTY50_SYMBOLS: List[Tuple[str, str]] = [
 ]
 PASSWORD_HASH_ITERATIONS = 100_000
 SESSION_EXPIRY_DAYS = 14
+ALERT_DIRECTIONS = {"ABOVE", "BELOW"}
+ALERT_CHANNELS = {"IN_APP", "EMAIL", "BOTH"}
+ALERT_DURATIONS = {"1_WEEK", "1_MONTH", "3_MONTHS", "UNTIL_HIT"}
 
 
 def _normalize_symbol(symbol: str) -> str:
     return symbol.strip().upper()
+
+
+def _apply_user_filter(query, model, user_id: Optional[int]):
+    if user_id is None:
+        return query
+    return query.filter(model.user_id == user_id)
 
 
 def _safe_number(value, default: float = 0.0) -> float:
@@ -188,11 +204,12 @@ def _upsert_portfolio_snapshot(
     db: Session,
     snapshot_date: date,
     portfolio_data: Dict[str, float],
+    user_id: Optional[int] = None,
     overwrite: bool = False,
 ) -> bool:
-    existing_snapshot = db.query(PortfolioSnapshot).filter(
-        PortfolioSnapshot.date == snapshot_date
-    ).first()
+    existing_snapshot = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).filter(PortfolioSnapshot.date == snapshot_date).first()
 
     if existing_snapshot:
         if not overwrite:
@@ -203,6 +220,7 @@ def _upsert_portfolio_snapshot(
     else:
         db.add(
             PortfolioSnapshot(
+                user_id=user_id,
                 total_value=portfolio_data["total_current_value"],
                 total_invested=portfolio_data["total_invested"],
                 pnl=portfolio_data["total_pnl"],
@@ -249,18 +267,19 @@ def _build_daily_returns_from_rows(snapshots) -> Dict[date, float]:
     return _build_daily_returns(list(snapshots))
 
 
-def _get_holding_by_symbol(db: Session, symbol: str) -> Optional[Holding]:
-    return db.query(Holding).filter(func.upper(Holding.symbol) == symbol).first()
+def _get_holding_by_symbol(db: Session, symbol: str, user_id: Optional[int] = None) -> Optional[Holding]:
+    query = _apply_user_filter(db.query(Holding), Holding, user_id)
+    return query.filter(func.upper(Holding.symbol) == symbol).first()
 
 
 def _apply_transaction_to_holdings(
-    db: Session, symbol: str, quantity: float, price: float, txn_type: str
+    db: Session, symbol: str, quantity: float, price: float, txn_type: str, user_id: Optional[int] = None
 ) -> None:
-    holding = _get_holding_by_symbol(db, symbol)
+    holding = _get_holding_by_symbol(db, symbol, user_id=user_id)
 
     if txn_type == "BUY":
         if not holding:
-            db.add(Holding(symbol=symbol, quantity=quantity, avg_price=price))
+            db.add(Holding(user_id=user_id, symbol=symbol, quantity=quantity, avg_price=price))
             return
 
         existing_qty = _safe_number(holding.quantity)
@@ -293,8 +312,8 @@ def _apply_transaction_to_holdings(
     raise ValueError(f"Unsupported transaction type: {txn_type}")
 
 
-def update_prices(db: Session):
-    holdings = db.query(Holding).all()
+def update_prices(db: Session, user_id: Optional[int] = None):
+    holdings = _apply_user_filter(db.query(Holding), Holding, user_id).all()
     today = date.today()
 
     symbols = sorted({
@@ -333,8 +352,8 @@ def update_prices(db: Session):
     except IntegrityError:
         db.rollback()
 
-    portfolio_data = calculate_portfolio_value(db, as_of=today)
-    snapshot_created = _upsert_portfolio_snapshot(db, today, portfolio_data)
+    portfolio_data = calculate_portfolio_value(db, as_of=today, user_id=user_id)
+    snapshot_created = _upsert_portfolio_snapshot(db, today, portfolio_data, user_id=user_id)
 
     return {
         "updated_prices": updated_prices,
@@ -343,8 +362,8 @@ def update_prices(db: Session):
     }
 
 
-def calculate_portfolio_value(db: Session, as_of: Optional[date] = None):
-    holdings = db.query(Holding).all()
+def calculate_portfolio_value(db: Session, as_of: Optional[date] = None, user_id: Optional[int] = None):
+    holdings = _apply_user_filter(db.query(Holding), Holding, user_id).all()
     today = as_of or date.today()
 
     total_invested = 0.0
@@ -388,8 +407,10 @@ def calculate_portfolio_value(db: Session, as_of: Optional[date] = None):
     }
 
 
-def calculate_performance_metrics(db: Session):
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+def calculate_performance_metrics(db: Session, user_id: Optional[int] = None):
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date).all()
 
     if len(snapshots) < 2:
         return {"message": "Not enough data for performance calculation"}
@@ -412,8 +433,10 @@ def calculate_performance_metrics(db: Session):
     }
 
 
-def calculate_daily_returns(db: Session, limit: Optional[int] = None):
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date.asc()).all()
+def calculate_daily_returns(db: Session, limit: Optional[int] = None, user_id: Optional[int] = None):
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date.asc()).all()
 
     if len(snapshots) < 2:
         return {"message": "Not enough data for daily return calculation"}
@@ -440,8 +463,10 @@ def calculate_daily_returns(db: Session, limit: Optional[int] = None):
     }
 
 
-def calculate_max_drawdown(db: Session):
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+def calculate_max_drawdown(db: Session, user_id: Optional[int] = None):
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date).all()
 
     if len(snapshots) < 2:
         return {"message": "Not enough data for drawdown calculation"}
@@ -475,8 +500,10 @@ def calculate_max_drawdown(db: Session):
     }
 
 
-def calculate_volatility(db: Session):
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+def calculate_volatility(db: Session, user_id: Optional[int] = None):
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date).all()
 
     if len(snapshots) < 2:
         return {"message": "Not enough data for volatility calculation"}
@@ -495,8 +522,10 @@ def calculate_volatility(db: Session):
     }
 
 
-def calculate_sharpe_ratio(db: Session):
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+def calculate_sharpe_ratio(db: Session, user_id: Optional[int] = None):
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date).all()
 
     if len(snapshots) < 2:
         return {"message": "Not enough data for Sharpe ratio calculation"}
@@ -521,11 +550,13 @@ def calculate_sharpe_ratio(db: Session):
     }
 
 
-def calculate_rolling_volatility(db: Session, window: int = 3):
+def calculate_rolling_volatility(db: Session, window: int = 3, user_id: Optional[int] = None):
     if window < 2:
         return {"message": "Window must be at least 2"}
 
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date).all()
     daily_returns = list(_build_daily_returns(snapshots).values())
 
     if len(daily_returns) < window:
@@ -548,13 +579,15 @@ def calculate_rolling_volatility(db: Session, window: int = 3):
 
 
 
-def _get_aligned_return_series(db: Session, benchmark_symbol: str = "^NSEI"):
+def _get_aligned_return_series(db: Session, benchmark_symbol: str = "^NSEI", user_id: Optional[int] = None):
     """
     Returns two aligned pandas Series:
     portfolio_returns, benchmark_returns
     aligned by common dates.
     """
-    snapshots = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date).all()
+    snapshots = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date).all()
 
     if len(snapshots) < 2:
         return None, None
@@ -675,8 +708,8 @@ def _get_aligned_return_series_for_snapshots(
     return aligned.iloc[:, 0], aligned.iloc[:, 1]
 
 
-def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI"):
-    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+def calculate_beta(db: Session, benchmark_symbol: str = "^NSEI", user_id: Optional[int] = None):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol, user_id=user_id)
 
     if aligned_portfolio is None:
         return {"message": "Not enough overlapping dates with benchmark"}
@@ -703,8 +736,9 @@ def calculate_alpha(
     db: Session,
     benchmark_symbol: str = "^NSEI",
     risk_free_rate_annual: float = RISK_FREE_RATE_ANNUAL,
+    user_id: Optional[int] = None,
 ):
-    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol, user_id=user_id)
 
     if aligned_portfolio is None:
         return {"message": "Not enough overlapping dates with benchmark"}
@@ -734,8 +768,8 @@ def calculate_alpha(
     }
 
 
-def calculate_information_ratio(db: Session, benchmark_symbol: str = "^NSEI"):
-    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+def calculate_information_ratio(db: Session, benchmark_symbol: str = "^NSEI", user_id: Optional[int] = None):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol, user_id=user_id)
 
     if aligned_portfolio is None:
         return {"message": "Not enough overlapping dates with benchmark"}
@@ -765,8 +799,8 @@ def calculate_information_ratio(db: Session, benchmark_symbol: str = "^NSEI"):
     }
 
 
-def calculate_tracking_error(db: Session, benchmark_symbol: str = "^NSEI"):
-    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol)
+def calculate_tracking_error(db: Session, benchmark_symbol: str = "^NSEI", user_id: Optional[int] = None):
+    aligned_portfolio, aligned_benchmark = _get_aligned_return_series(db, benchmark_symbol, user_id=user_id)
 
     if aligned_portfolio is None:
         return {"message": "Not enough overlapping dates with benchmark"}
@@ -787,13 +821,14 @@ def calculate_tracking_error(db: Session, benchmark_symbol: str = "^NSEI"):
         "observations": len(active_returns),
     }
 
-def create_transaction(db: Session, txn: TransactionCreate):
+def create_transaction(db: Session, txn: TransactionCreate, user_id: Optional[int] = None):
     symbol = _normalize_symbol(txn.symbol)
     txn_type = txn.type.upper()
     quantity = _safe_number(txn.quantity)
     price = _safe_number(txn.price)
 
     transaction = Transaction(
+        user_id=user_id,
         symbol=symbol,
         quantity=quantity,
         price=price,
@@ -803,7 +838,7 @@ def create_transaction(db: Session, txn: TransactionCreate):
 
     try:
         db.add(transaction)
-        _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type)
+        _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type, user_id=user_id)
         db.commit()
     except Exception:
         db.rollback()
@@ -814,7 +849,7 @@ def create_transaction(db: Session, txn: TransactionCreate):
     return transaction
 
 
-def create_transactions(db: Session, txns: List[TransactionCreate]):
+def create_transactions(db: Session, txns: List[TransactionCreate], user_id: Optional[int] = None):
     transactions: List[Transaction] = []
 
     try:
@@ -825,6 +860,7 @@ def create_transactions(db: Session, txns: List[TransactionCreate]):
             price = _safe_number(txn.price)
 
             transaction = Transaction(
+                user_id=user_id,
                 symbol=symbol,
                 quantity=quantity,
                 price=price,
@@ -833,7 +869,7 @@ def create_transactions(db: Session, txns: List[TransactionCreate]):
             )
             transactions.append(transaction)
             db.add(transaction)
-            _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type)
+            _apply_transaction_to_holdings(db, symbol, quantity, price, txn_type, user_id=user_id)
             # Session autoflush is disabled globally, so explicit flush is required
             # for subsequent operations in the same batch to observe pending writes.
             db.flush()
@@ -848,12 +884,12 @@ def create_transactions(db: Session, txns: List[TransactionCreate]):
 
     return transactions
 
-def calculate_holdings_from_transactions(db: Session, as_of: Optional[date] = None):
+def calculate_holdings_from_transactions(db: Session, as_of: Optional[date] = None, user_id: Optional[int] = None):
     cutoff = as_of or date.today()
 
-    transactions = db.query(Transaction).filter(
-        Transaction.date <= cutoff
-    ).order_by(Transaction.date.asc(), Transaction.id.asc()).all()
+    transactions = _apply_user_filter(
+        db.query(Transaction), Transaction, user_id
+    ).filter(Transaction.date <= cutoff).order_by(Transaction.date.asc(), Transaction.id.asc()).all()
 
     holdings: Dict[str, float] = {}
     negative_symbols: List[str] = []
@@ -880,8 +916,8 @@ def calculate_holdings_from_transactions(db: Session, as_of: Optional[date] = No
         "negative_symbols": sorted(set(negative_symbols)),
     }
 
-def portfolio_value_from_ledger(db: Session, as_of: Optional[date] = None):
-    ledger = calculate_holdings_from_transactions(db, as_of)
+def portfolio_value_from_ledger(db: Session, as_of: Optional[date] = None, user_id: Optional[int] = None):
+    ledger = calculate_holdings_from_transactions(db, as_of, user_id=user_id)
     holdings = ledger["holdings"]
     negative_symbols = ledger["negative_symbols"]
 
@@ -1149,7 +1185,7 @@ def _fetch_close_for_date(holding: ImportedHolding, target_date: date) -> Option
     return None
 
 
-def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
+def import_holdings_workbook(db: Session, payload: HoldingsImportPayload, user_id: Optional[int] = None):
     file_bytes = decode_base64_document(payload.content_base64)
     workbook = parse_xlsx_holdings(file_bytes)
 
@@ -1157,7 +1193,7 @@ def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
     if not rows:
         raise ValueError("No holding rows were found in the uploaded workbook")
 
-    db.query(ImportedHolding).delete()
+    _apply_user_filter(db.query(ImportedHolding), ImportedHolding, user_id).delete()
 
     created_rows = 0
     imported_at = datetime.utcnow()
@@ -1183,6 +1219,7 @@ def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
 
         db.add(
             ImportedHolding(
+                user_id=user_id,
                 symbol=_normalize_symbol(str(row.get("symbol", ""))),
                 company_name=row.get("company_name"),
                 isin=row.get("isin"),
@@ -1204,8 +1241,8 @@ def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
         created_rows += 1
 
     db.commit()
-    refresh_imported_holdings_market_data(db)
-    _upsert_imported_portfolio_snapshot(db, imported_at.date(), overwrite=True)
+    refresh_imported_holdings_market_data(db, user_id=user_id)
+    _upsert_imported_portfolio_snapshot(db, imported_at.date(), user_id=user_id, overwrite=True)
 
     return {
         "message": "Holdings imported successfully",
@@ -1215,8 +1252,10 @@ def import_holdings_workbook(db: Session, payload: HoldingsImportPayload):
     }
 
 
-def refresh_imported_holdings_market_data(db: Session):
-    holdings = db.query(ImportedHolding).order_by(ImportedHolding.symbol.asc()).all()
+def refresh_imported_holdings_market_data(db: Session, user_id: Optional[int] = None):
+    holdings = _apply_user_filter(
+        db.query(ImportedHolding), ImportedHolding, user_id
+    ).order_by(ImportedHolding.symbol.asc()).all()
     updated = 0
     failed_symbols: List[str] = []
 
@@ -1253,7 +1292,7 @@ def refresh_imported_holdings_market_data(db: Session):
         updated += 1
 
     db.commit()
-    snapshot_created = _upsert_imported_portfolio_snapshot(db)
+    snapshot_created = _upsert_imported_portfolio_snapshot(db, user_id=user_id)
 
     return {
         "message": "Imported holdings refreshed",
@@ -1299,16 +1338,20 @@ def _refresh_single_imported_holding(holding: ImportedHolding) -> None:
     holding.unrealized_pnl = _safe_number(holding.current_value) - _safe_number(holding.invested_amount)
 
 
-def apply_imported_holding_transaction(db: Session, txn: ImportedHoldingTransactionCreate):
+def apply_imported_holding_transaction(
+    db: Session,
+    txn: ImportedHoldingTransactionCreate,
+    user_id: Optional[int] = None,
+):
     symbol = _normalize_symbol(txn.symbol)
     txn_type = txn.type.upper()
     quantity = _safe_number(txn.quantity)
     price = _safe_number(txn.price)
     txn_date = txn.date or date.today()
 
-    holding = db.query(ImportedHolding).filter(
-        func.upper(ImportedHolding.symbol) == symbol
-    ).first()
+    holding = _apply_user_filter(
+        db.query(ImportedHolding), ImportedHolding, user_id
+    ).filter(func.upper(ImportedHolding.symbol) == symbol).first()
 
     if not holding:
         raise ValueError(f"No imported holding found for {symbol}")
@@ -1318,6 +1361,7 @@ def apply_imported_holding_transaction(db: Session, txn: ImportedHoldingTransact
     existing_invested = _safe_number(holding.invested_amount)
 
     manual_txn = ImportedHoldingTransaction(
+        user_id=user_id,
         symbol=symbol,
         quantity=quantity,
         price=price,
@@ -1366,6 +1410,7 @@ def apply_imported_holding_transaction(db: Session, txn: ImportedHoldingTransact
     _upsert_imported_portfolio_snapshot(
         db,
         snapshot_date=txn_date,
+        user_id=user_id,
         allow_empty=True,
         overwrite=True,
     )
@@ -1373,6 +1418,7 @@ def apply_imported_holding_transaction(db: Session, txn: ImportedHoldingTransact
         _upsert_imported_portfolio_snapshot(
             db,
             snapshot_date=date.today(),
+            user_id=user_id,
             allow_empty=True,
             overwrite=True,
         )
@@ -1579,16 +1625,18 @@ def _imported_portfolio_totals(holdings: List[ImportedHolding]) -> Dict[str, flo
 def _upsert_imported_holdings_snapshot(
     db: Session,
     snapshot_date: Optional[date] = None,
+    user_id: Optional[int] = None,
     allow_empty: bool = False,
     overwrite: bool = False,
 ) -> bool:
-    holdings = db.query(ImportedHolding).all()
+    holdings = _apply_user_filter(db.query(ImportedHolding), ImportedHolding, user_id).all()
     if not holdings and not allow_empty:
         return False
 
     return _upsert_imported_portfolio_snapshot(
         db,
         snapshot_date or date.today(),
+        user_id=user_id,
         allow_empty=allow_empty,
         overwrite=overwrite,
     )
@@ -1597,10 +1645,11 @@ def _upsert_imported_holdings_snapshot(
 def _upsert_imported_portfolio_snapshot(
     db: Session,
     snapshot_date: Optional[date] = None,
+    user_id: Optional[int] = None,
     allow_empty: bool = False,
     overwrite: bool = False,
 ) -> bool:
-    holdings = db.query(ImportedHolding).all()
+    holdings = _apply_user_filter(db.query(ImportedHolding), ImportedHolding, user_id).all()
     if not holdings and not allow_empty:
         return False
 
@@ -1615,9 +1664,9 @@ def _upsert_imported_portfolio_snapshot(
     )
 
     target_date = snapshot_date or date.today()
-    existing_snapshot = db.query(ImportedPortfolioSnapshot).filter(
-        ImportedPortfolioSnapshot.date == target_date
-    ).first()
+    existing_snapshot = _apply_user_filter(
+        db.query(ImportedPortfolioSnapshot), ImportedPortfolioSnapshot, user_id
+    ).filter(ImportedPortfolioSnapshot.date == target_date).first()
 
     if existing_snapshot:
         if not overwrite:
@@ -1628,6 +1677,7 @@ def _upsert_imported_portfolio_snapshot(
     else:
         db.add(
             ImportedPortfolioSnapshot(
+                user_id=user_id,
                 total_value=portfolio_data["total_current_value"],
                 total_invested=portfolio_data["total_invested"],
                 pnl=portfolio_data["total_pnl"],
@@ -1644,15 +1694,21 @@ def _upsert_imported_portfolio_snapshot(
     return True
 
 
-def _ensure_imported_snapshot_history(db: Session) -> None:
-    existing_count = db.query(ImportedPortfolioSnapshot).count()
+def _ensure_imported_snapshot_history(db: Session, user_id: Optional[int] = None) -> None:
+    existing_count = _apply_user_filter(
+        db.query(ImportedPortfolioSnapshot), ImportedPortfolioSnapshot, user_id
+    ).count()
     if existing_count > 0:
         return
 
-    latest_import = db.query(ImportedHolding).order_by(ImportedHolding.imported_at.desc()).first()
+    latest_import = _apply_user_filter(
+        db.query(ImportedHolding), ImportedHolding, user_id
+    ).order_by(ImportedHolding.imported_at.desc()).first()
     import_cutoff = latest_import.imported_at.date() if latest_import and latest_import.imported_at else None
 
-    query = db.query(PortfolioSnapshot).order_by(PortfolioSnapshot.date.asc())
+    query = _apply_user_filter(
+        db.query(PortfolioSnapshot), PortfolioSnapshot, user_id
+    ).order_by(PortfolioSnapshot.date.asc())
     if import_cutoff:
         query = query.filter(PortfolioSnapshot.date >= import_cutoff)
 
@@ -1661,6 +1717,7 @@ def _ensure_imported_snapshot_history(db: Session) -> None:
         for snapshot in legacy_snapshots:
             db.add(
                 ImportedPortfolioSnapshot(
+                    user_id=user_id,
                     total_value=snapshot.total_value,
                     total_invested=snapshot.total_invested,
                     pnl=snapshot.pnl,
@@ -1673,7 +1730,7 @@ def _ensure_imported_snapshot_history(db: Session) -> None:
         except IntegrityError:
             db.rollback()
 
-    _upsert_imported_portfolio_snapshot(db, allow_empty=True, overwrite=True)
+    _upsert_imported_portfolio_snapshot(db, user_id=user_id, allow_empty=True, overwrite=True)
 
 
 def _fetch_benchmark_mini_chart(symbol: str, fallback_name: str) -> Dict[str, object]:
@@ -1840,8 +1897,14 @@ def _fetch_benchmark_mini_chart(symbol: str, fallback_name: str) -> Dict[str, ob
     }
 
 
-def _calculate_imported_risk_metrics(db: Session, benchmark_symbol: str = "^NSEI") -> Dict[str, object]:
-    snapshots = db.query(ImportedPortfolioSnapshot).order_by(ImportedPortfolioSnapshot.date.asc()).all()
+def _calculate_imported_risk_metrics(
+    db: Session,
+    benchmark_symbol: str = "^NSEI",
+    user_id: Optional[int] = None,
+) -> Dict[str, object]:
+    snapshots = _apply_user_filter(
+        db.query(ImportedPortfolioSnapshot), ImportedPortfolioSnapshot, user_id
+    ).order_by(ImportedPortfolioSnapshot.date.asc()).all()
     daily_returns = list(_build_daily_returns_from_rows(snapshots).values())
 
     sharpe_ratio = None
@@ -1896,6 +1959,7 @@ def _apply_imported_buy(
     quantity: float,
     price: float,
     txn_date: date,
+    user_id: Optional[int] = None,
     record_label: str = "BUY",
 ) -> None:
     existing_qty = _safe_number(holding.quantity)
@@ -1910,6 +1974,7 @@ def _apply_imported_buy(
 
     db.add(
         ImportedHoldingTransaction(
+            user_id=user_id,
             symbol=_normalize_symbol(holding.symbol),
             quantity=quantity,
             price=price,
@@ -2099,14 +2164,27 @@ def get_nifty50_ticker_snapshot() -> Dict[str, object]:
 
 def run_sip_job(
     db: Session,
+    user_id: Optional[int] = None,
     trigger: str = "SCHEDULED",
     force: bool = False,
 ) -> Dict[str, object]:
+    if user_id is None:
+        return {
+            "status": "skipped",
+            "trigger": (trigger or "SCHEDULED").strip().upper(),
+            "run_date": date.today().isoformat(),
+            "processed_sips": 0,
+            "reason": "User-scoped execution required",
+            "last_run_at": None,
+        }
+
     run_date = date.today()
     now = datetime.utcnow()
     normalized_trigger = (trigger or "SCHEDULED").strip().upper()
 
-    run_log = db.query(SipJobRun).filter(SipJobRun.run_date == run_date).first()
+    run_log = _apply_user_filter(db.query(SipJobRun), SipJobRun, user_id).filter(
+        SipJobRun.run_date == run_date
+    ).first()
     if (
         run_log
         and run_log.status == "SUCCESS"
@@ -2122,7 +2200,7 @@ def run_sip_job(
         }
 
     if run_log is None:
-        run_log = SipJobRun(run_date=run_date)
+        run_log = SipJobRun(user_id=user_id, run_date=run_date)
         db.add(run_log)
 
     run_log.trigger = normalized_trigger
@@ -2135,7 +2213,7 @@ def run_sip_job(
     db.commit()
 
     try:
-        result = process_due_sips(db)
+        result = process_due_sips(db, user_id=user_id)
         processed = int(result.get("processed_sips") or 0)
         run_log.status = "SUCCESS"
         run_log.processed_sips = processed
@@ -2151,9 +2229,11 @@ def run_sip_job(
         }
     except Exception as exc:
         db.rollback()
-        run_log = db.query(SipJobRun).filter(SipJobRun.run_date == run_date).first()
+        run_log = _apply_user_filter(db.query(SipJobRun), SipJobRun, user_id).filter(
+            SipJobRun.run_date == run_date
+        ).first()
         if run_log is None:
-            run_log = SipJobRun(run_date=run_date)
+            run_log = SipJobRun(user_id=user_id, run_date=run_date)
             db.add(run_log)
         run_log.trigger = normalized_trigger
         run_log.status = "FAILED"
@@ -2163,8 +2243,10 @@ def run_sip_job(
         raise
 
 
-def get_sip_job_status(db: Session) -> Dict[str, object]:
-    logs = db.query(SipJobRun).order_by(SipJobRun.run_date.desc()).all()
+def get_sip_job_status(db: Session, user_id: Optional[int] = None) -> Dict[str, object]:
+    logs = _apply_user_filter(
+        db.query(SipJobRun), SipJobRun, user_id
+    ).order_by(SipJobRun.run_date.desc()).all()
     last_run = logs[0] if logs else None
     today = date.today()
     today_run = next((log for log in logs if log.run_date == today), None)
@@ -2205,9 +2287,12 @@ def get_sip_job_status(db: Session) -> Dict[str, object]:
     }
 
 
-def process_due_sips(db: Session) -> Dict[str, int]:
+def process_due_sips(db: Session, user_id: Optional[int] = None) -> Dict[str, int]:
+    if user_id is None:
+        return {"processed_sips": 0}
+
     today = date.today()
-    sips = db.query(RecurringSip).filter(
+    sips = _apply_user_filter(db.query(RecurringSip), RecurringSip, user_id).filter(
         RecurringSip.active == 1,
         RecurringSip.next_run_date <= today,
     ).order_by(RecurringSip.next_run_date.asc(), RecurringSip.id.asc()).all()
@@ -2215,7 +2300,9 @@ def process_due_sips(db: Session) -> Dict[str, int]:
     processed = 0
 
     for sip in sips:
-        holding = db.query(ImportedHolding).filter(
+        holding = _apply_user_filter(
+            db.query(ImportedHolding), ImportedHolding, user_id
+        ).filter(
             func.upper(ImportedHolding.symbol) == _normalize_symbol(sip.symbol)
         ).first()
         if not holding:
@@ -2239,6 +2326,7 @@ def process_due_sips(db: Session) -> Dict[str, int]:
                 quantity=quantity,
                 price=unit_price,
                 txn_date=run_date,
+                user_id=user_id,
                 record_label="SIP_BUY",
             )
             processed += 1
@@ -2258,6 +2346,7 @@ def process_due_sips(db: Session) -> Dict[str, int]:
             _upsert_imported_portfolio_snapshot(
                 db,
                 snapshot_date=run_date,
+                user_id=user_id,
                 allow_empty=True,
                 overwrite=True,
             )
@@ -2266,8 +2355,8 @@ def process_due_sips(db: Session) -> Dict[str, int]:
     return {"processed_sips": processed}
 
 
-def create_recurring_sip(db: Session, payload: RecurringSipCreate):
-    holding = db.query(ImportedHolding).filter(
+def create_recurring_sip(db: Session, payload: RecurringSipCreate, user_id: Optional[int] = None):
+    holding = _apply_user_filter(db.query(ImportedHolding), ImportedHolding, user_id).filter(
         func.upper(ImportedHolding.symbol) == _normalize_symbol(payload.symbol)
     ).first()
     if not holding:
@@ -2277,6 +2366,7 @@ def create_recurring_sip(db: Session, payload: RecurringSipCreate):
         raise ValueError("Recurring SIP is currently supported only for mutual funds")
 
     sip = RecurringSip(
+        user_id=user_id,
         symbol=_normalize_symbol(payload.symbol),
         amount=_safe_number(payload.amount),
         start_date=payload.start_date,
@@ -2287,7 +2377,7 @@ def create_recurring_sip(db: Session, payload: RecurringSipCreate):
     db.add(sip)
     db.commit()
     db.refresh(sip)
-    process_due_sips(db)
+    process_due_sips(db, user_id=user_id)
 
     return {
         "id": sip.id,
@@ -2305,11 +2395,14 @@ def _build_normalized_performance_comparison(
     benchmark_symbol: str = "^NSEI",
     snapshot_model=PortfolioSnapshot,
     performance_period: str = "1Y",
+    user_id: Optional[int] = None,
 ) -> Dict[str, object]:
     period_key = (performance_period or "1Y").strip().upper()
     lookback_years = {"1Y": 1, "3Y": 3, "5Y": 5}.get(period_key, 1)
 
-    snapshots = db.query(snapshot_model).order_by(snapshot_model.date.asc()).all()
+    snapshots = _apply_user_filter(
+        db.query(snapshot_model), snapshot_model, user_id
+    ).order_by(snapshot_model.date.asc()).all()
 
     if len(snapshots) < 2:
         return {
@@ -2472,11 +2565,14 @@ def get_imported_portfolio_dashboard(
     db: Session,
     category: str = "ALL",
     performance_period: str = "1Y",
+    user_id: Optional[int] = None,
 ):
-    _ensure_imported_snapshot_history(db)
-    process_due_sips(db)
+    _ensure_imported_snapshot_history(db, user_id=user_id)
+    process_due_sips(db, user_id=user_id)
     normalized_category = category.strip().upper() if category else "ALL"
-    holdings = db.query(ImportedHolding).order_by(ImportedHolding.symbol.asc()).all()
+    holdings = _apply_user_filter(
+        db.query(ImportedHolding), ImportedHolding, user_id
+    ).order_by(ImportedHolding.symbol.asc()).all()
 
     available_categories = ["ALL"] + sorted(
         {_display_asset_type(_normalize_asset_type(holding.asset_type)) for holding in holdings}
@@ -2524,7 +2620,9 @@ def get_imported_portfolio_dashboard(
         else None
     )
 
-    latest_import = db.query(ImportedHolding).order_by(ImportedHolding.imported_at.desc()).first()
+    latest_import = _apply_user_filter(
+        db.query(ImportedHolding), ImportedHolding, user_id
+    ).order_by(ImportedHolding.imported_at.desc()).first()
     nifty_chart = _fetch_benchmark_mini_chart("^NSEI", "Nifty 50")
     sensex_chart = _fetch_benchmark_mini_chart("^BSESN", "Sensex")
 
@@ -2539,8 +2637,10 @@ def get_imported_portfolio_dashboard(
         benchmark["name"] = nifty_chart.get("name")
 
     benchmark_pe = benchmark.get("pe_ratio")
-    risk_metrics = _calculate_imported_risk_metrics(db, "^NSEI")
-    recurring_sips = db.query(RecurringSip).order_by(RecurringSip.next_run_date.asc(), RecurringSip.id.asc()).all()
+    risk_metrics = _calculate_imported_risk_metrics(db, "^NSEI", user_id=user_id)
+    recurring_sips = _apply_user_filter(
+        db.query(RecurringSip), RecurringSip, user_id
+    ).order_by(RecurringSip.next_run_date.asc(), RecurringSip.id.asc()).all()
 
     return {
         "overview": {
@@ -2568,6 +2668,7 @@ def get_imported_portfolio_dashboard(
             "^NSEI",
             snapshot_model=ImportedPortfolioSnapshot,
             performance_period=performance_period,
+            user_id=user_id,
         ),
         "recurring_sips": [
             {
@@ -2588,3 +2689,311 @@ def get_imported_portfolio_dashboard(
         "import_file_name": latest_import.source_file if latest_import else None,
         "imported_at": latest_import.imported_at.isoformat() if latest_import else None,
     }
+
+
+def _duration_to_expiry(duration: str, start_at: Optional[datetime] = None) -> Optional[datetime]:
+    now = start_at or datetime.utcnow()
+    normalized = (duration or "UNTIL_HIT").strip().upper()
+
+    if normalized == "1_WEEK":
+        return now + timedelta(days=7)
+    if normalized == "1_MONTH":
+        return now + timedelta(days=30)
+    if normalized == "3_MONTHS":
+        return now + timedelta(days=90)
+    return None
+
+
+def _serialize_price_alert(alert: PriceAlert) -> Dict[str, object]:
+    payload = PriceAlertSummary(
+        id=alert.id,
+        symbol=alert.symbol,
+        target_price=round(_safe_number(alert.target_price), 2),
+        direction=(alert.direction or "ABOVE").upper(),
+        duration=(alert.duration or "UNTIL_HIT").upper(),
+        channel=(alert.channel or "IN_APP").upper(),
+        status=(alert.status or "ACTIVE").upper(),
+        last_checked_price=round(_safe_number(alert.last_checked_price), 2) if alert.last_checked_price is not None else None,
+        triggered_price=round(_safe_number(alert.triggered_price), 2) if alert.triggered_price is not None else None,
+        note=alert.note,
+        triggered_at=alert.triggered_at.isoformat() if alert.triggered_at else None,
+        expires_at=alert.expires_at.isoformat() if alert.expires_at else None,
+        created_at=alert.created_at.isoformat() if alert.created_at else None,
+    )
+    return payload.model_dump()
+
+
+def _serialize_alert_notification(notification: AlertNotification) -> Dict[str, object]:
+    payload = AlertNotificationSummary(
+        id=notification.id,
+        alert_id=notification.alert_id,
+        channel=(notification.channel or "IN_APP").upper(),
+        title=notification.title or "Price alert",
+        message=notification.message or "",
+        delivery_status=(notification.delivery_status or "CREATED").upper(),
+        read=bool(notification.read_at),
+        read_at=notification.read_at.isoformat() if notification.read_at else None,
+        created_at=notification.created_at.isoformat() if notification.created_at else None,
+    )
+    return payload.model_dump()
+
+
+def _resolve_alert_market_price(symbol: str) -> Optional[float]:
+    normalized = _normalize_symbol(symbol)
+    candidates = [normalized]
+    if "." not in normalized:
+        candidates.extend([f"{normalized}.NS", f"{normalized}.BO"])
+
+    for candidate in candidates:
+        price = _fetch_latest_close(candidate)
+        if price is not None:
+            return price
+    return None
+
+
+def _should_trigger_price_alert(direction: str, current_price: float, target_price: float) -> bool:
+    normalized = (direction or "ABOVE").strip().upper()
+    if normalized == "BELOW":
+        return current_price <= target_price
+    return current_price >= target_price
+
+
+def _send_price_alert_email(to_email: str, subject: str, body: str) -> Tuple[bool, str]:
+    smtp_host = (os.getenv("SMTP_HOST") or "").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_username = (os.getenv("SMTP_USERNAME") or "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD") or ""
+    smtp_sender = (os.getenv("SMTP_FROM_EMAIL") or "").strip()
+    smtp_starttls = str(os.getenv("SMTP_STARTTLS", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+    if not smtp_host or not smtp_sender:
+        return False, "Email delivery is not configured"
+
+    message = EmailMessage()
+    message["From"] = smtp_sender
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=8) as smtp:
+            smtp.ehlo()
+            if smtp_starttls:
+                smtp.starttls()
+                smtp.ehlo()
+            if smtp_username:
+                smtp.login(smtp_username, smtp_password)
+            smtp.send_message(message)
+        return True, "Sent"
+    except Exception as exc:
+        return False, f"Email delivery failed: {exc}"
+
+
+def _create_alert_notification(
+    db: Session,
+    user_id: int,
+    alert_id: int,
+    channel: str,
+    title: str,
+    message: str,
+    delivery_status: str = "CREATED",
+) -> AlertNotification:
+    notification = AlertNotification(
+        user_id=user_id,
+        alert_id=alert_id,
+        channel=channel,
+        title=title,
+        message=message,
+        delivery_status=delivery_status,
+    )
+    db.add(notification)
+    return notification
+
+
+def create_price_alert(
+    db: Session,
+    user_id: int,
+    payload: PriceAlertCreate,
+) -> Dict[str, object]:
+    symbol = _normalize_symbol(payload.symbol)
+    direction = (payload.direction or "ABOVE").strip().upper()
+    duration = (payload.duration or "UNTIL_HIT").strip().upper()
+    channel = (payload.channel or "IN_APP").strip().upper()
+
+    if direction not in ALERT_DIRECTIONS:
+        raise ValueError("direction must be ABOVE or BELOW")
+    if duration not in ALERT_DURATIONS:
+        raise ValueError("Unsupported duration")
+    if channel not in ALERT_CHANNELS:
+        raise ValueError("Unsupported channel")
+
+    now = datetime.utcnow()
+    target_price = _safe_number(payload.target_price)
+    if target_price <= 0:
+        raise ValueError("target_price must be greater than zero")
+
+    expires_at = _duration_to_expiry(duration, start_at=now)
+
+    alert = PriceAlert(
+        user_id=user_id,
+        symbol=symbol,
+        target_price=target_price,
+        direction=direction,
+        duration=duration,
+        channel=channel,
+        status="ACTIVE",
+        expires_at=expires_at,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return _serialize_price_alert(alert)
+
+
+def list_user_price_alerts(
+    db: Session,
+    user_id: int,
+    include_inactive: bool = False,
+) -> List[Dict[str, object]]:
+    query = db.query(PriceAlert).filter(PriceAlert.user_id == user_id)
+    if not include_inactive:
+        query = query.filter(PriceAlert.status.in_(["ACTIVE", "TRIGGERED"]))
+    alerts = query.order_by(PriceAlert.created_at.desc(), PriceAlert.id.desc()).all()
+    return [_serialize_price_alert(alert) for alert in alerts]
+
+
+def list_user_alert_notifications(
+    db: Session,
+    user_id: int,
+    limit: int = 50,
+    unread_only: bool = False,
+) -> List[Dict[str, object]]:
+    safe_limit = max(1, min(int(limit), 200))
+    query = db.query(AlertNotification).filter(AlertNotification.user_id == user_id)
+    if unread_only:
+        query = query.filter(AlertNotification.read_at.is_(None))
+    rows = query.order_by(AlertNotification.created_at.desc(), AlertNotification.id.desc()).limit(safe_limit).all()
+    return [_serialize_alert_notification(row) for row in rows]
+
+
+def mark_alert_notification_read(
+    db: Session,
+    user_id: int,
+    notification_id: int,
+) -> Dict[str, object]:
+    notification = db.query(AlertNotification).filter(
+        AlertNotification.id == notification_id,
+        AlertNotification.user_id == user_id,
+    ).first()
+    if not notification:
+        raise ValueError("Notification not found")
+
+    if notification.read_at is None:
+        notification.read_at = datetime.utcnow()
+        db.commit()
+        db.refresh(notification)
+
+    return _serialize_alert_notification(notification)
+
+
+def evaluate_price_alerts(db: Session, user_id: Optional[int] = None) -> Dict[str, object]:
+    now = datetime.utcnow()
+    query = db.query(PriceAlert).filter(PriceAlert.status == "ACTIVE")
+    if user_id is not None:
+        query = query.filter(PriceAlert.user_id == user_id)
+    alerts = query.order_by(PriceAlert.created_at.asc(), PriceAlert.id.asc()).all()
+
+    checked = 0
+    triggered = 0
+    expired = 0
+    failed_symbols: List[str] = []
+    created_notifications = 0
+
+    for alert in alerts:
+        checked += 1
+        if alert.expires_at and alert.expires_at <= now:
+            alert.status = "EXPIRED"
+            alert.note = "Alert duration elapsed"
+            alert.updated_at = now
+            expired += 1
+            continue
+
+        current_price = _resolve_alert_market_price(alert.symbol)
+        if current_price is None:
+            failed_symbols.append(alert.symbol)
+            continue
+
+        alert.last_checked_price = current_price
+        alert.updated_at = now
+
+        if not _should_trigger_price_alert(alert.direction, current_price, _safe_number(alert.target_price)):
+            continue
+
+        alert.status = "TRIGGERED"
+        alert.triggered_price = current_price
+        alert.triggered_at = now
+        alert.note = f"Triggered at {current_price:.2f}"
+        triggered += 1
+
+        direction_text = "rose above" if (alert.direction or "ABOVE").upper() == "ABOVE" else "fell below"
+        title = f"{alert.symbol} price alert triggered"
+        message = (
+            f"{alert.symbol} has {direction_text} your target of "
+            f"{_safe_number(alert.target_price):.2f}. Current price: {current_price:.2f}."
+        )
+
+        channel = (alert.channel or "IN_APP").upper()
+        if channel in {"IN_APP", "BOTH"}:
+            _create_alert_notification(
+                db=db,
+                user_id=int(alert.user_id),
+                alert_id=int(alert.id),
+                channel="IN_APP",
+                title=title,
+                message=message,
+                delivery_status="SENT",
+            )
+            created_notifications += 1
+
+        if channel in {"EMAIL", "BOTH"}:
+            user = db.query(User).filter(User.id == alert.user_id).first()
+            if user and user.email:
+                sent, note = _send_price_alert_email(user.email, title, message)
+                _create_alert_notification(
+                    db=db,
+                    user_id=int(alert.user_id),
+                    alert_id=int(alert.id),
+                    channel="EMAIL",
+                    title=title,
+                    message=note if sent else f"{message} {note}",
+                    delivery_status="SENT" if sent else "FAILED",
+                )
+                created_notifications += 1
+            else:
+                _create_alert_notification(
+                    db=db,
+                    user_id=int(alert.user_id),
+                    alert_id=int(alert.id),
+                    channel="EMAIL",
+                    title=title,
+                    message=f"{message} Email address not available for this account.",
+                    delivery_status="FAILED",
+                )
+                created_notifications += 1
+
+    db.commit()
+
+    return {
+        "checked_alerts": checked,
+        "triggered_alerts": triggered,
+        "expired_alerts": expired,
+        "notifications_created": created_notifications,
+        "failed_symbols": sorted(set(failed_symbols)),
+        "checked_at": now.isoformat(),
+    }
+
+
+def run_price_alert_check_job(db: Session, user_id: Optional[int] = None) -> Dict[str, object]:
+    return evaluate_price_alerts(db, user_id=user_id)

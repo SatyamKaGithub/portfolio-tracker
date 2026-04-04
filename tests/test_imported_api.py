@@ -3,9 +3,10 @@ from datetime import datetime
 from app.models import ImportedHolding
 
 
-def test_add_recurring_sip_endpoint_success(client, db_session, monkeypatch):
+def test_add_recurring_sip_endpoint_success(client, db_session, monkeypatch, auth_headers):
     db_session.add(
         ImportedHolding(
+            user_id=1,
             symbol="AXISMF",
             company_name="Axis Flexicap",
             asset_type="MUTUAL_FUND",
@@ -22,11 +23,12 @@ def test_add_recurring_sip_endpoint_success(client, db_session, monkeypatch):
     )
     db_session.commit()
 
-    monkeypatch.setattr("app.services.process_due_sips", lambda db: {"processed_sips": 0})
+    monkeypatch.setattr("app.services.process_due_sips", lambda *args, **kwargs: {"processed_sips": 0})
 
     response = client.post(
         "/imports/holdings/sips",
         json={"symbol": "AXISMF", "amount": 2000, "start_date": "2026-01-10"},
+        headers=auth_headers,
     )
     assert response.status_code == 200
     body = response.json()
@@ -38,9 +40,10 @@ def test_add_recurring_sip_endpoint_success(client, db_session, monkeypatch):
     assert body["active"] is True
 
 
-def test_add_recurring_sip_endpoint_returns_400_for_stock(client, db_session):
+def test_add_recurring_sip_endpoint_returns_400_for_stock(client, db_session, auth_headers):
     db_session.add(
         ImportedHolding(
+            user_id=1,
             symbol="INFY",
             company_name="Infosys",
             asset_type="STOCK",
@@ -60,15 +63,17 @@ def test_add_recurring_sip_endpoint_returns_400_for_stock(client, db_session):
     response = client.post(
         "/imports/holdings/sips",
         json={"symbol": "INFY", "amount": 500, "start_date": "2026-01-10"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 400
     assert "currently supported only for mutual funds" in response.json()["detail"]
 
 
-def test_imported_transaction_endpoint_buy_updates_holding(client, db_session, monkeypatch):
+def test_imported_transaction_endpoint_buy_updates_holding(client, db_session, monkeypatch, auth_headers):
     db_session.add(
         ImportedHolding(
+            user_id=1,
             symbol="HDFCBANK",
             company_name="HDFC Bank",
             asset_type="STOCK",
@@ -98,6 +103,7 @@ def test_imported_transaction_endpoint_buy_updates_holding(client, db_session, m
             "type": "BUY",
             "date": "2026-01-12",
         },
+        headers=auth_headers,
     )
     assert response.status_code == 200
 
@@ -107,9 +113,10 @@ def test_imported_transaction_endpoint_buy_updates_holding(client, db_session, m
     assert body["date"] == "2026-01-12"
 
 
-def test_imported_dashboard_endpoint_works_with_stubbed_dependencies(client, db_session, monkeypatch):
+def test_imported_dashboard_endpoint_works_with_stubbed_dependencies(client, db_session, monkeypatch, auth_headers):
     db_session.add(
         ImportedHolding(
+            user_id=1,
             symbol="AXISMF",
             company_name="Axis Flexicap",
             asset_type="MUTUAL_FUND",
@@ -129,8 +136,8 @@ def test_imported_dashboard_endpoint_works_with_stubbed_dependencies(client, db_
     )
     db_session.commit()
 
-    monkeypatch.setattr("app.services._ensure_imported_snapshot_history", lambda db: None)
-    monkeypatch.setattr("app.services.process_due_sips", lambda db: {"processed_sips": 0})
+    monkeypatch.setattr("app.services._ensure_imported_snapshot_history", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.services.process_due_sips", lambda *args, **kwargs: {"processed_sips": 0})
     monkeypatch.setattr(
         "app.services._fetch_benchmark_mini_chart",
         lambda symbol, name: {
@@ -157,7 +164,7 @@ def test_imported_dashboard_endpoint_works_with_stubbed_dependencies(client, db_
     )
     monkeypatch.setattr(
         "app.services._calculate_imported_risk_metrics",
-        lambda db, benchmark_symbol="^NSEI": {
+        lambda *args, **kwargs: {
             "sharpe_ratio": 1.2,
             "beta": 0.8,
             "alpha_annualized_percent": 2.5,
@@ -178,6 +185,7 @@ def test_imported_dashboard_endpoint_works_with_stubbed_dependencies(client, db_
     response = client.get(
         "/portfolio/imported-dashboard",
         params={"category": "MUTUAL_FUND", "performance_period": "1Y"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200
